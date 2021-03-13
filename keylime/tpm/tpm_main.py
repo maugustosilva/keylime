@@ -23,11 +23,13 @@ from keylime import cmd_exec
 from keylime import config
 from keylime import keylime_logging
 from keylime import secure_mount
-from keylime import tpm_bootlog_enrich
 from keylime.tpm import tpm_abstract
 from keylime import tpm_ek_ca
 from keylime.common import algorithms
 from keylime.tpm import tpm2_objects
+
+if os.uname()[4] == 'x86_64' :
+    from keylime import tpm_bootlog_enrich
 
 logger = keylime_logging.init_logging('tpm')
 
