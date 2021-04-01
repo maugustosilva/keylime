@@ -25,6 +25,7 @@ import uuid
 import time
 import tenant
 
+import _io
 
 from distutils.dir_util import copy_tree
 import shutil
@@ -330,13 +331,14 @@ class Test(unittest.TestCase):
     def check_test_sleep(self, test_method_name, test_function_name, state_change_or_validation, test_iteration, argument):
         time.sleep(argument)
 
-#'{"v": "nsRIy93UeeAi3GhAxpEcMH6R7OmaB7ArBdn2bEgyEwU=","agent_id":"06480EC4-6BF3-4F00-8323-FE6AE5868297","cloudagent_ip":"127.0.0.1","cloudagent_port":"8882","tpm_policy": {"00": "0000000000000000000000000000000000000000", "mask": "0x400801", "22": "ffffffffffffffffffffffffffffffffffffffff"}}',
+# '{"v": "nsRIy93UeeAi3GhAxpEcMH6R7OmaB7ArBdn2bEgyEwU=","agent_id":"06480EC4-6BF3-4F00-8323-FE6AE5868297","cloudagent_ip":"127.0.0.1","cloudagent_port":"8882","tpm_policy": {"00": "0000000000000000000000000000000000000000", "mask": "0x400801", "22": "ffffffffffffffffffffffffffffffffffffffff"}}',
 
     def read_line_in_file(self, infile, line_number):
         with open(infile) as fp:
             for i, line in enumerate(fp):
                 if i == line_number:
                     return line
+        return ''
 
     def sleep_for_a_while(self, argument):
         time.sleep(float(argument))
@@ -499,7 +501,7 @@ class Test(unittest.TestCase):
                 quote = jsondecoded.get("quote")
 
                 # test to make sure these two keys (and values) are in the return
-                if public_key == None or quote == None:
+                if public_key is None or quote is None:
                     self.fail("Expected both pubkey and quote arguments.")
                 else:
 
@@ -544,7 +546,7 @@ class Test(unittest.TestCase):
                 target_body = test_functions.get("http_result_body_actual")
                 jsondecoded = json.loads(target_body)
                 # test to make sure these two keys (and values) are in the return
-                if jsondecoded.get("pubkey") == None or jsondecoded.get("quote") == None:
+                if jsondecoded.get("pubkey") is None or jsondecoded.get("quote") is None:
                     self.fail("Expected both pubkey and quote arguments.")
 
     def check_validate_test_cloudverifier_tenant_provide_v(self, test_method_name, test_function_name, state_change_or_validation, test_iteration, argument):
@@ -616,7 +618,7 @@ class Test(unittest.TestCase):
             # self._testMethodName, test_functions["function_name"], setup_or_state_change_or_validation, check_argument
             function_return = getattr(self, pre_function_name)(
                 self._testMethodName, test_functions["function_name"], setup_or_state_change_or_validation, test_iteration, pre_function_args)
-            if function_return == False:
+            if not function_return:
                 self.fail("Test " + self._testMethodName + ":" +
                           test_functions["function_name"] + ":" + pre_function_name + " pre_function failure, test aborted.")
 
@@ -625,12 +627,12 @@ class Test(unittest.TestCase):
         http_request_body_tag = test_functions.get("http_request_body")
         http_request_body_file_tag = test_functions.get(
             "http_request_body_file")
-        if http_request_body_tag != None and http_request_body_file_tag != None:
+        if http_request_body_tag is not None and http_request_body_file_tag is not None:
             self.fail("Test " + self._testMethodName + ":" +
                       test_functions["function_name"] + " contains both http_request_body and http_request_body_file tags.")
 
         thedata = ''
-        if http_request_body_tag == None and http_request_body_file_tag != None:
+        if http_request_body_tag is None and http_request_body_file_tag is not None:
             thedata = open(http_request_body_file_tag).read()
         else:
             thedata = http_request_body_tag
@@ -658,7 +660,7 @@ class Test(unittest.TestCase):
             self.fail("Test " + self._testMethodName + ":" + test_functions["function_name"] + " expected " + str(
                 test_functions["http_result_status_expected"]) + " but received " + str(test_functions["http_result_status_actual"]))  # reset the file marker for reading
         # validate response headers
-        if test_functions.get("http_result_header_expected") is not None and not (all(item in list(response.headers.items()) for item in list(test_functions["http_result_header_expected"].items()))):
+        if test_functions.get("http_result_header_expected") is not None and not all(item in list(response.headers.items()) for item in list(test_functions["http_result_header_expected"].items())):
             self.fail("Test " + self._testMethodName + ":" +
                       test_functions["function_name"] + ", didn't receive expected headers.")
         # validate (shallow) response body
@@ -680,7 +682,7 @@ class Test(unittest.TestCase):
             post_function_args = post_function.get('args')
             function_return = getattr(self, post_function_name)(
                 self._testMethodName, test_functions["function_name"], setup_or_state_change_or_validation, test_iteration, post_function_args)
-            if function_return == False:
+            if not function_return:
                 self.fail("Test " + self._testMethodName + ":" +
                           test_functions["function_name"] + ":" + post_function_name + " post_function failure, test aborted.")
 
@@ -694,12 +696,12 @@ class Test(unittest.TestCase):
             http_request_body_tag = test_functions.get("http_request_body")
             http_request_body_file_tag = test_functions.get(
                 "http_request_body_file")
-            if http_request_body_tag != None and http_request_body_file_tag != None:
+            if http_request_body_tag is not None and http_request_body_file_tag is not None:
                 self.fail("Test " + self._testMethodName + ":" +
                           test_functions["function_name"] + " contains both http_request_body and http_request_body_file tags.")
 
             thedata = ''
-            if http_request_body_tag == None and http_request_body_file_tag != None:
+            if http_request_body_tag is None and http_request_body_file_tag is not None:
                 thedata = open(http_request_body_file_tag).read()
             else:
                 thedata = http_request_body_tag
@@ -725,7 +727,7 @@ class Test(unittest.TestCase):
             string_to_write = json.dumps(argument)
         elif isinstance(argument, str):
             string_to_write = argument
-        elif isinstance(argument, file):
+        elif isinstance(argument, _io.TextIOWrapper):
             string_to_write = argument.read()
             argument.close()
         elif argument is None:
@@ -746,7 +748,7 @@ class Test(unittest.TestCase):
 
         # modify the persistence file per the passed argument
         if argument is not None:
-            string_to_write = self.modify_persistence_file(argument)
+            self.modify_persistence_file(argument)
 
         global cv_process
         cv_process = subprocess.Popen("python cloud_verifier.py", shell=True)
@@ -785,9 +787,11 @@ class Test(unittest.TestCase):
                 shutil.copyfile(common.CONFIG_FILE, config_file_path)
                 if not os.path.isdir(new_dir):
                     os.mkdir(new_dir)
-                #shutil.copyfile(r'../keylime.conf', new_dir + r'/keylime.conf')
-                self.overwrite_config_file(
-                    config_file_path, 'general', 'cloudagent_port', str(cloudagent_start_port))
+                # shutil.copyfile(r'../keylime.conf', new_dir + r'/keylime.conf')
+                self.overwrite_config_file(config_file_path,
+                                           'general',
+                                           'cloudagent_port',
+                                           str(cloudagent_start_port))
                 port_string_length = len(str(cloudagent_start_port))
                 contrived_uuid = test_agent_uuid[:-port_string_length]
                 contrived_uuid = contrived_uuid + str(cloudagent_start_port)
@@ -819,7 +823,7 @@ class Test(unittest.TestCase):
                 shutil.copyfile(common.CONFIG_FILE, config_file_path)
                 if not os.path.isdir(new_dir):
                     os.mkdir(new_dir)
-                #shutil.copyfile(r'../keylime.conf', new_dir + r'/keylime.conf')
+                # shutil.copyfile(r'../keylime.conf', new_dir + r'/keylime.conf')
                 self.overwrite_config_file(
                     config_file_path, 'general', 'cloudagent_port', cloudagent_port_read_from_file)
                 port_string_length = len(cloudagent_port_read_from_file)
@@ -1029,10 +1033,10 @@ class Test(unittest.TestCase):
         pass
 
     def tearDown(self):
-        #os.killpg(self.cloudverifier_process.pid, signal.SIGKILL)
+        # os.killpg(self.cloudverifier_process.pid, signal.SIGKILL)
         pass
 
 
 if __name__ == "__main__":
-    #import sys;sys.argv = ['', 'Test.testName']
+    # import sys;sys.argv = ['', 'Test.testName']
     unittest.main()

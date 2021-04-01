@@ -9,21 +9,35 @@ from sqlalchemy.orm import sessionmaker, scoped_session
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.engine.url import URL
 
-from keylime import common
+from keylime import config
 from keylime import keylime_logging
 
+logger = keylime_logging.init_logging('keylime_db')
+
+
 class DBEngineManager:
+
+    def __init__(self):
+        self.service = None
+
     def make_engine(self, service):
         """
         To use: engine = self.make_engine('cloud_verifier')
         """
         self.service = service
 
-        config = common.get_config()
-        drivername = config.get(service, 'drivername')
+        database_url = config.get(service, 'database_url')
+        if database_url:
+            engine = create_engine(database_url)
+            return engine
 
+        # TODO(kaifeng) Remove following code as well as related configuration
+        # options when the deprecation period is reached.
+        logger.warning('database_url is not set, using deprecated database '
+                       'configuration options')
+        drivername = config.get(service, 'drivername')
         if drivername == 'sqlite':
-            database = "%s/%s" % (common.WORK_DIR,
+            database = "%s/%s" % (config.WORK_DIR,
                                   config.get(service, 'database'))
             # Create the path to where the sqlite database will be store with a perm umask of 077
             os.umask(0o077)
@@ -53,6 +67,9 @@ class DBEngineManager:
 
 
 class SessionManager:
+    def __init__(self):
+        self.engine = None
+
     def make_session(self, engine):
         """
         To use: session = self.make_session(engine)
@@ -62,7 +79,5 @@ class SessionManager:
             Session = scoped_session(sessionmaker())
             Session.configure(bind=self.engine)
         except SQLAlchemyError as e:
-            logger = keylime_logging.init_logging('sql_session_manager')
-            logger.error(f'Error creating SQL session manager {e}')
+            logger.error('Error creating SQL session manager %s', e)
         return Session()
-

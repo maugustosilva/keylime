@@ -3,18 +3,16 @@ SPDX-License-Identifier: Apache-2.0
 Copyright 2020 Luke Hinds (lhinds@redhat.com), Red Hat, Inc.
 '''
 
+import simplejson as json
+
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy import Column, String, Integer, PickleType, Text
 
-try:
-    import simplejson as json
-except ImportError:
-    raise("Simplejson is mandatory, please install")
 
 Base = declarative_base()
 
 
-class JSONPickleType(PickleType):
+class JSONPickleType(PickleType):  # pylint: disable=abstract-method
     impl = Text
 
 
@@ -31,8 +29,9 @@ class VerfierMain(Base):
     vtpm_policy = Column(String(1000))
     meta_data = Column(String(200))
     allowlist = Column(Text(429400000))
+    ima_sign_verification_keys = Column(Text(429400000))
+    mb_refstate = Column(Text(429400000))
     revocation_key = Column(String(2800))
-    tpm_version = Column(Integer)
     accept_tpm_hash_algs = Column(JSONPickleType(pickler=json))
     accept_tpm_encryption_algs = Column(JSONPickleType(pickler=json))
     accept_tpm_signing_algs = Column(JSONPickleType(pickler=json))

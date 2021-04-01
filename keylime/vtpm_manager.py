@@ -14,17 +14,19 @@ import time
 import tempfile
 from uuid import UUID
 
-try:
-    import simplejson as json
-except ImportError:
-    raise("Simplejson is mandatory, please install")
+import simplejson as json
 
-from keylime import common
+try:
+    from yaml import CSafeDumper as SafeDumper
+except ImportError:
+    from yaml import SafeDumper
+
+from keylime import config
 from keylime import keylime_logging
-from keylime.tpm import tpm_obj
+from keylime.tpm.tpm_main import tpm
 
 # get the tpm object
-tpm = tpm_obj.getTPM(need_hw_tpm=True)
+tpm_instance = tpm(need_hw_tpm=True)
 
 sys.path.append(os.path.dirname(__file__))
 
@@ -245,7 +247,7 @@ def vtpm_raw(hdr, msg):
     rsp_body = rsp[10:]
     (rsp_type, rsp_len, _) = struct.unpack('>HII', rsp_hdr)
     assert rsp_len == 10 + len(rsp_body), \
-        "Invalid Response:[Len]: {0:#x} vs {1:#x}".format(rsp_len, 10+rsp_body)
+        "Invalid Response:[Len]: {0:#x} vs {1:#x}".format(rsp_len, 10 + rsp_body)
     logger.debug('Response Type: 0x%x (%d bytes)', rsp_type, rsp_len)
     logger.debug('Response Body: "%r"', repr(rsp_body.encode('hex')))
     return rsp_body
@@ -282,14 +284,14 @@ def show_group(group_num):
         vtpms = [stringify_uuid(vtpm) for vtpm in vtpms]
         for i, vtpm in enumerate(vtpms):
             logger.info('    [%d]: %s', i, vtpm)
-        out['vtpms'].append(vtpm)
+            out['vtpms'].append(vtpm)
     out['uuid'] = uuid
     return out
 
 
 def count_groups():
     """ Get number of groups using VTPM_ORD_GROUP_LIST"""
-    body = vtpm_raw(0x1C2, struct.pack('>I',  VTPM_ORD_GROUP_LIST))
+    body = vtpm_raw(0x1C2, struct.pack('>I', VTPM_ORD_GROUP_LIST))
     (num_groups,) = struct.unpack('>I', body)
     return num_groups
 
@@ -336,7 +338,7 @@ def add_group(rsa_mod_path):
         rsa_mod = f.read()
     assert len(rsa_mod) == 256
     ca_digest = '\x00' * 20
-    rsp = vtpm_cmd(VTPM_ORD_GROUP_NEW,  ca_digest + rsa_mod)
+    rsp = vtpm_cmd(VTPM_ORD_GROUP_NEW, ca_digest + rsa_mod)
 
     (uuid, aik_pub, aik_priv_ca) = struct.unpack('16s256s256s', rsp)
     uuid = struct.unpack(uuid_fmt, uuid)
@@ -389,7 +391,7 @@ def get_group_info(num):
     return {'aikpem': aikpem, 'uuid': uuid}
 
 
-def get_group_symkey(groupnum, aikpem, pubekpem, keyblob):
+def get_group_symkey(groupnum, keyblob):
     logger.info('Keyblob: %r', open(keyblob, 'rb').read())
     return do_group_activate(groupnum, keyblob)
 
@@ -418,7 +420,7 @@ def do_register_test_helper(groupnum=1,
         aikpem, pubekpem, keyblob, goalkey), shell=True)
 
     # Obtain the symkey via group activate
-    symkey_raw = get_group_symkey(groupnum, aikpem, pubekpem, keyblob)
+    symkey_raw = get_group_symkey(groupnum, keyblob)
     with open(symkey, 'wb') as f:
         f.write(symkey_raw)
     logger.info('Wrote %s', symkey)
@@ -446,8 +448,8 @@ def tpmconv(inmod):
         inFile.close()
         os.close(infd)
 
-        command = "tpmconv -ik %s -ok %s" % (inFile.name, tmppath)
-        tpm.__run(command, lock=False)
+        command = ('tpmconv', '-ik', 'inFile.name', '-ok', tmppath)
+        tpm_instance.run(command)
 
         # read in the pem
         f = open(tmppath, "rb")
@@ -477,9 +479,9 @@ def get_group_num(desired_uuid):
 def add_vtpm_group(rsa_mod=None):
     """ Add new vtpm group"""
     fprt = "add_vtpm_group"
-    if common.STUB_TPM and common.TPM_CANNED_VALUES is not None:
+    if config.STUB_TPM and config.TPM_CANNED_VALUES is not None:
         # Use canned values for stubbing
-        jsonIn = common.TPM_CANNED_VALUES
+        jsonIn = config.TPM_CANNED_VALUES
         if fprt in jsonIn:
             # The value we're looking for has been canned!
             thisTiming = jsonIn[fprt]['timing']
@@ -488,9 +490,9 @@ def add_vtpm_group(rsa_mod=None):
                 fprt, thisTiming))
             time.sleep(thisTiming)
             return tuple(thisRetout)
-        else:
-            # Our command hasn't been canned!
-            raise Exception("Command %s not found in canned JSON!" % (fprt))
+
+        # Our command hasn't been canned!
+        raise Exception("Command %s not found in canned JSON!" % (fprt))
 
     logger.debug('Adding group')
 
@@ -500,7 +502,7 @@ def add_vtpm_group(rsa_mod=None):
         rsa_mod = '\x00' * 256
     assert len(rsa_mod) == 256
     ca_digest = '\x00' * 20
-    rsp = vtpm_cmd(VTPM_ORD_GROUP_NEW,  ca_digest + rsa_mod)
+    rsp = vtpm_cmd(VTPM_ORD_GROUP_NEW, ca_digest + rsa_mod)
 
     (uuid, aik_pub, aik_priv_ca) = struct.unpack('16s256s256s', rsp)
     uuid = struct.unpack(uuid_fmt, uuid)
@@ -514,10 +516,17 @@ def add_vtpm_group(rsa_mod=None):
 
     retout = (uuid, aikpem, group_num, base64.b64encode(aik_priv_ca))
 
-    if common.TPM_CANNED_VALUES_PATH is not None:
-        with open(common.TPM_CANNED_VALUES_PATH, "ab") as can:
-            jsonObj = {'type': "add_vtpm_group", 'retout': list(
-                retout), 'fileout': "", 'cmd': "add_vtpm_group", 'timing': t1-t0, 'code': 0, 'nonce': None}
+    if config.TPM_CANNED_VALUES_PATH is not None:
+        with open(config.TPM_CANNED_VALUES_PATH, "ab") as can:
+            jsonObj = {
+                'type': "add_vtpm_group",
+                'retout': list(retout),
+                'fileout': "",
+                'cmd': "add_vtpm_group",
+                'timing': t1 - t0,
+                'code': 0,
+                'nonce': None
+            }
             can.write("\"%s\": %s,\n" % ("add_vtpm_group", json.dumps(
                 jsonObj, indent=4, sort_keys=True, Dumper=SafeDumper)))
 
@@ -526,9 +535,9 @@ def add_vtpm_group(rsa_mod=None):
 
 def activate_group(uuid, keyblob):
     fprt = "activate_group"
-    if common.STUB_TPM and common.TPM_CANNED_VALUES is not None:
+    if config.STUB_TPM and config.TPM_CANNED_VALUES is not None:
         # Use canned values for stubbing
-        jsonIn = common.TPM_CANNED_VALUES
+        jsonIn = config.TPM_CANNED_VALUES
         if fprt in jsonIn:
             # The value we're looking for has been canned!
             thisTiming = jsonIn[fprt]['timing']
@@ -537,9 +546,9 @@ def activate_group(uuid, keyblob):
                 fprt, thisTiming))
             time.sleep(thisTiming)
             return base64.b64decode(thisRetout)
-        else:
-            # Our command hasn't been canned!
-            raise Exception("Command %s not found in canned JSON!" % (fprt))
+
+        # Our command hasn't been canned!
+        raise Exception("Command %s not found in canned JSON!" % (fprt))
 
     t0 = time.time()
     group_id = get_group_num(uuid)
@@ -555,10 +564,17 @@ def activate_group(uuid, keyblob):
                 algId, encScheme, size)
     logger.info('Key: %r', body)
 
-    if common.TPM_CANNED_VALUES_PATH is not None:
-        with open(common.TPM_CANNED_VALUES_PATH, "ab") as can:
-            jsonObj = {'type': "activate_group", 'retout': base64.b64encode(
-                body), 'fileout': "", 'cmd': "activate_group", 'timing': t1-t0, 'code': 0, 'nonce': None}
+    if config.TPM_CANNED_VALUES_PATH is not None:
+        with open(config.TPM_CANNED_VALUES_PATH, "ab") as can:
+            jsonObj = {
+                'type': "activate_group",
+                'retout': base64.b64encode(body),
+                'fileout': "",
+                'cmd': "activate_group",
+                'timing': t1 - t0,
+                'code': 0,
+                'nonce': None
+            }
             can.write("\"%s\": %s,\n" % ("activate_group",
                                          json.dumps(jsonObj, indent=4, sort_keys=True)))
 
@@ -567,9 +583,9 @@ def activate_group(uuid, keyblob):
 
 def add_vtpm_to_group(uuid):
     fprt = "add_vtpm_to_group"
-    if common.STUB_TPM and common.TPM_CANNED_VALUES is not None:
+    if config.STUB_TPM and config.TPM_CANNED_VALUES is not None:
         # Use canned values for stubbing
-        jsonIn = common.TPM_CANNED_VALUES
+        jsonIn = config.TPM_CANNED_VALUES
         if fprt in jsonIn:
             # The value we're looking for has been canned!
             thisTiming = jsonIn[fprt]['timing']
@@ -578,9 +594,9 @@ def add_vtpm_to_group(uuid):
                 fprt, thisTiming))
             time.sleep(thisTiming)
             return thisRetout
-        else:
-            # Our command hasn't been canned!
-            raise Exception("Command %s not found in canned JSON!" % (fprt))
+
+        # Our command hasn't been canned!
+        raise Exception("Command %s not found in canned JSON!" % (fprt))
 
     t0 = time.time()
     num = get_group_num(uuid)
@@ -589,10 +605,17 @@ def add_vtpm_to_group(uuid):
 
     retout = str(UUID(vtpm_uuid)).upper()
 
-    if common.TPM_CANNED_VALUES_PATH is not None:
-        with open(common.TPM_CANNED_VALUES_PATH, "ab") as can:
-            jsonObj = {'type': "add_vtpm_to_group", 'retout': retout, 'fileout': "",
-                       'cmd': "add_vtpm_to_group", 'timing': t1-t0, 'code': 0, 'nonce': None}
+    if config.TPM_CANNED_VALUES_PATH is not None:
+        with open(config.TPM_CANNED_VALUES_PATH, "ab") as can:
+            jsonObj = {
+                'type': "add_vtpm_to_group",
+                'retout': retout,
+                'fileout': "",
+                'cmd': "add_vtpm_to_group",
+                'timing': t1 - t0,
+                'code': 0,
+                'nonce': None
+            }
             can.write("\"%s\": %s,\n" % ("add_vtpm_to_group",
                                          json.dumps(jsonObj, indent=4, sort_keys=True)))
 

@@ -8,10 +8,8 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 import sys
 import uuid
 
-try:
-    import simplejson as json
-except ImportError:
-    raise("Simplejson is mandatory, please install")
+import simplejson as json
+
 
 TESTING_MODE = False
 
@@ -30,7 +28,6 @@ class myHandler(BaseHTTPRequestHandler):
         else:
             myUUID = provider_vtpm_add.add_vtpm("current_group.tpm")
         self.request.sendall(json.dumps({'uuid': myUUID}))
-        return
 
 
 try:

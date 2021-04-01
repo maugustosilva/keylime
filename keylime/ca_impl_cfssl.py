@@ -8,23 +8,19 @@ import os
 import subprocess
 import socket
 import time
-import requests
 import shutil
 import sys
 
-try:
-    import simplejson as json
-except ImportError:
-    raise("Simplejson is mandatory, please install")
+import requests
+import simplejson as json
+from M2Crypto import EVP, X509
 
-from keylime import common
+from keylime import config
 from keylime import keylime_logging
 from keylime import secure_mount
-from M2Crypto import EVP, X509
 
 logger = keylime_logging.init_logging('ca_impl_cfssl')
 
-config = common.get_config()
 cfssl_ip = config.get('ca', 'cfssl_ip')
 cfssl_port = config.get('ca', 'cfssl_port')
 
@@ -65,7 +61,7 @@ def start_cfssl(cmdline=""):
     global cfsslproc
     cmd = "cfssl serve -loglevel=1 %s " % cmdline
     env = os.environ.copy()
-    env['PATH'] = env['PATH']+":/usr/local/bin"
+    env['PATH'] = env['PATH'] + ":/usr/local/bin"
 
     # make sure cfssl isn't running
     os.system('pkill -f cfssl')
@@ -73,7 +69,7 @@ def start_cfssl(cmdline=""):
     cfsslproc = subprocess.Popen(cmd, env=env, shell=True, stdout=subprocess.PIPE,
                                  stderr=subprocess.STDOUT, universal_newlines=True)
     if cfsslproc.returncode is not None:
-        raise Exception("Unable to launch %: failed with code " %
+        raise Exception("Unable to launch %s: failed with code %d" %
                         (cmd, cfsslproc.returncode))
 
     logger.debug("Waiting for cfssl to start...")
@@ -123,11 +119,12 @@ def mk_cacert():
         pkey = cert.get_pubkey()
 
         return pk_str, cert, pk, pkey
-    else:
-        raise Exception("Unable to create CA")
+
+    raise Exception("Unable to create CA")
 
 
 def mk_signed_cert(cacert, ca_pk, name, serialnum):
+    del cacert, serialnum
     csr = {"request": {
         "CN": name,
         "hosts": [
@@ -152,7 +149,7 @@ def mk_signed_cert(cacert, ca_pk, name, serialnum):
     # check CRL distribution point
     disturl = config.get('ca', 'cert_crl_dist')
     if disturl == 'default':
-        disturl = "http://%s:%s/crl.der" % (socket.getfqdn(), common.CRL_PORT)
+        disturl = "http://%s:%s/crl.der" % (socket.getfqdn(), config.CRL_PORT)
 
     # set up config for cfssl server
     cfsslconfig = {
@@ -189,8 +186,8 @@ def mk_signed_cert(cacert, ca_pk, name, serialnum):
         cert = X509.load_cert_string(
             body['result']['certificate'].encode("utf-8"))
         return cert, pk
-    else:
-        raise Exception("Unable to create cert for %s" % name)
+
+    raise Exception("Unable to create cert for %s" % name)
 
 
 def gencrl(serials, cert, ca_pk):

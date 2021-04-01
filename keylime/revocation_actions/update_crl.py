@@ -11,7 +11,7 @@ import os
 import keylime.tornado_requests as tornado_requests
 import keylime.ca_util as ca_util
 import keylime.secure_mount as secure_mount
-import keylime.common as common
+import keylime.config as common
 import keylime.keylime_logging as keylime_logging
 
 # read the config file
@@ -43,16 +43,16 @@ def execute(json_revocation):
         oldcrl = f.read()
 
     updated = False
-    for i in range(10):
+    for _ in range(10):
         logger.debug("Getting updated CRL from %s" % dist_path)
         response = tornado_requests.request("GET", dist_path, None, None, None)
         if response.status_code != 200:
-            logger.warn("Unable to get updated CRL from %s.  Code %d" %
-                        (dist_path, response.status_code))
+            logger.warning("Unable to get updated CRL from %s.  Code %d" %
+                           (dist_path, response.status_code))
             time.sleep(1)
             continue
         if response.body == oldcrl:
-            logger.warn("CRL not yet updated, trying again in 1 second...")
+            logger.warning("CRL not yet updated, trying again in 1 second...")
             time.sleep(1)
             continue
 

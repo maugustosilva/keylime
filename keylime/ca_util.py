@@ -3,55 +3,7 @@
 '''
 SPDX-License-Identifier: Apache-2.0
 Copyright 2017 Massachusetts Institute of Technology.
-'''
 
-from M2Crypto import X509, EVP, BIO
-import sys
-import os
-import base64
-import argparse
-import datetime
-import getpass
-import zipfile
-import io
-import socket
-from keylime import revocation_notifier
-import threading
-import http.server
-from http.server import HTTPServer, BaseHTTPRequestHandler
-from socketserver import ThreadingMixIn
-import functools
-import signal
-import time
-import yaml
-try:
-    from yaml import CSafeLoader as SafeLoader, CSafeDumper as SafeDumper
-except ImportError:
-    from yaml import SafeLoader as SafeLoader, SafeDumper as SafeDumper
-
-try:
-    import simplejson as json
-except ImportError:
-    raise("Simplejson is mandatory, please install")
-
-from keylime import crypto
-from keylime import cmd_exec
-from keylime import common
-
-from keylime import keylime_logging
-logger = keylime_logging.init_logging('ca-util')
-
-if common.CA_IMPL == 'cfssl':
-    from keylime import ca_impl_cfssl as ca_impl
-elif common.CA_IMPL == 'openssl':
-    from keylime import ca_impl_openssl as ca_impl
-else:
-    raise Exception("Unknown CA implementation: %s" % common.CA_IMPL)
-
-config = common.get_config()
-
-
-"""
 Tools for creating a CA cert and signed server certs.
 Divined from http://svn.osafoundation.org/m2crypto/trunk/tests/test_x509.py
 The mk_temporary_xxx calls return a NamedTemporaryFile with certs.
@@ -60,18 +12,60 @@ Usage ;
    cacert, cakey = mk_temporary_cacert()
    # Create a temporary server cert+key, signed by the CA
    server_cert = mk_temporary_cert(cacert.name, cakey.name, '*.server.co.uk')
-"""
-# protips
+
+protips
 # openssl verify -CAfile cacert.crt cacert.crt cert.crt
 # openssl x509 -in cert.crt -noout -text
 # openssl x509 -in cacert.crt -noout -text
+'''
+
+import sys
+import os
+import base64
+import argparse
+import datetime
+import getpass
+import glob
+import zipfile
+import io
+import socket
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from socketserver import ThreadingMixIn
+import time
+import yaml
+try:
+    from yaml import CSafeLoader as SafeLoader, CSafeDumper as SafeDumper
+except ImportError:
+    from yaml import SafeLoader, SafeDumper
+
+import simplejson as json
+from M2Crypto import X509, EVP, BIO
+
+from keylime import cmd_exec
+from keylime import config
+from keylime import crypto
+from keylime import revocation_notifier
+from keylime import keylime_logging
+
+
+logger = keylime_logging.init_logging('ca-util')
+
+if config.CA_IMPL == 'cfssl':
+    from keylime import ca_impl_cfssl as ca_impl
+elif config.CA_IMPL == 'openssl':
+    from keylime import ca_impl_openssl as ca_impl
+else:
+    raise Exception("Unknown CA implementation: %s" % config.CA_IMPL)
+
+
 
 global_password = None
 
 
-def globalcb(*args):
-    global global_password
-    return global_password.encode()
+# def globalcb(*args):
+#    global global_password
+#    return global_password.encode()
 
 
 def setpassword(pw):
@@ -84,13 +78,13 @@ def setpassword(pw):
 def cmd_mkcert(workingdir, name):
     cwd = os.getcwd()
     try:
-        common.ch_dir(workingdir, logger)
+        config.ch_dir(workingdir, logger)
         priv = read_private()
         cacert = X509.load_cert('cacert.crt')
         ca_pk = EVP.load_key_string(priv[0]['ca'])
 
         cert, pk = ca_impl.mk_signed_cert(
-            cacert, ca_pk, name, priv[0]['lastserial']+1)
+            cacert, ca_pk, name, priv[0]['lastserial'] + 1)
 
         with open('%s-cert.crt' % name, 'wb') as f:
             f.write(cert.as_pem())
@@ -108,7 +102,7 @@ def cmd_mkcert(workingdir, name):
         # write out the private key with password
         with os.fdopen(os.open("%s-private.pem" % name, os.O_WRONLY | os.O_CREAT, 0o600), 'wb') as f:
             biofile = BIO.File(f)
-            pk.save_key_bio(biofile, 'aes_256_cbc', globalcb)
+            pk.save_key_bio(biofile, None)
             biofile.close()
 
         pk.get_rsa().save_pub_key('%s-public.pem' % name)
@@ -127,7 +121,7 @@ def cmd_mkcert(workingdir, name):
 def cmd_init(workingdir):
     cwd = os.getcwd()
     try:
-        common.ch_dir(workingdir, logger)
+        config.ch_dir(workingdir, logger)
 
         rmfiles("*.pem")
         rmfiles("*.crt")
@@ -135,12 +129,12 @@ def cmd_init(workingdir):
         rmfiles("*.der")
         rmfiles("private.yml")
 
-        if common.CA_IMPL == 'cfssl':
+        if config.CA_IMPL == 'cfssl':
             pk_str, cacert, ca_pk, _ = ca_impl.mk_cacert()
-        elif common.CA_IMPL == 'openssl':
-            cacert, ca_pk, _ = ca_impl.mk_cacert()
+        elif config.CA_IMPL == 'openssl':
+            cacert, ca_pk, _ = ca_impl.mk_cacert()  # pylint: disable=W0632
         else:
-            raise Exception("Unknown CA implementation: %s" % common.CA_IMPL)
+            raise Exception("Unknown CA implementation: %s" % config.CA_IMPL)
 
         priv = read_private()
 
@@ -162,12 +156,12 @@ def cmd_init(workingdir):
         ca_pk.get_rsa().save_pub_key('ca-public.pem')
 
         # generate an empty crl
-        if common.CA_IMPL == 'cfssl':
+        if config.CA_IMPL == 'cfssl':
             crl = ca_impl.gencrl([], cacert.as_pem(), pk_str)
-        elif common.CA_IMPL == 'openssl':
+        elif config.CA_IMPL == 'openssl':
             crl = ca_impl.gencrl([], cacert.as_pem(), str(priv[0]['ca']))
         else:
-            raise Exception("Unknown CA implementation: %s" % common.CA_IMPL)
+            raise Exception("Unknown CA implementation: %s" % config.CA_IMPL)
 
         if isinstance(crl, str):
             crl = crl.encode('utf-8')
@@ -190,7 +184,7 @@ def cmd_init(workingdir):
 def cmd_certpkg(workingdir, name, insecure=False):
     cwd = os.getcwd()
     try:
-        common.ch_dir(workingdir, logger)
+        config.ch_dir(workingdir, logger)
         # zip up the crt, private key, and public key
 
         with open('cacert.crt', 'r') as f:
@@ -238,7 +232,7 @@ def cmd_certpkg(workingdir, name, insecure=False):
         pkg = sf.getvalue()
 
         if insecure:
-            logger.warn(
+            logger.warning(
                 "Unprotected private keys in cert package being written to disk")
             with open('%s-pkg.zip' % name, 'w') as f:
                 f.write(pkg)
@@ -265,8 +259,9 @@ def convert_crl_to_pem(derfile, pemfile):
         with open(pemfile, 'w') as f:
             f.write("")
     else:
-        cmd_exec.run("openssl crl -in %s -inform der -out %s" %
-                     (derfile, pemfile), lock=False)
+        cmd = ('openssl', 'crl', '-in', derfile, '-inform', 'der',
+               '-out', pemfile)
+        cmd_exec.run(cmd)
 
 
 def get_crl_distpoint(cert_path):
@@ -290,7 +285,7 @@ def get_crl_distpoint(cert_path):
 def cmd_revoke(workingdir, name=None, serial=None):
     cwd = os.getcwd()
     try:
-        common.ch_dir(workingdir, logger)
+        config.ch_dir(workingdir, logger)
         priv = read_private()
 
         if name is not None and serial is not None:
@@ -319,9 +314,10 @@ def cmd_revoke(workingdir, name=None, serial=None):
         write_private(priv)
 
         # write out the CRL to the disk
-        with open('cacrl.der', 'wb') as f:
-            f.write(crl)
-        convert_crl_to_pem("cacrl.der", "cacrl.pem")
+        if os.stat('cacrl.der').st_size:
+            with open('cacrl.der', 'wb') as f:
+                f.write(crl)
+            convert_crl_to_pem("cacrl.der", "cacrl.pem")
 
     finally:
         os.chdir(cwd)
@@ -333,7 +329,7 @@ def cmd_revoke(workingdir, name=None, serial=None):
 def cmd_regencrl(workingdir):
     cwd = os.getcwd()
     try:
-        common.ch_dir(workingdir, logger)
+        config.ch_dir(workingdir, logger)
         priv = read_private()
 
         # get the ca key cert and keys as strings
@@ -358,11 +354,11 @@ def cmd_regencrl(workingdir):
 def cmd_listen(workingdir, cert_path):
     cwd = os.getcwd()
     try:
-        common.ch_dir(workingdir, logger)
+        config.ch_dir(workingdir, logger)
         # just load up the password for later
         read_private(True)
 
-        serveraddr = ('', common.CRL_PORT)
+        serveraddr = ('', config.CRL_PORT)
         server = ThreadedCRLServer(serveraddr, CRLHandler)
         if os.path.exists('cacrl.der'):
             logger.info("Loading existing crl: %s" %
@@ -371,23 +367,25 @@ def cmd_listen(workingdir, cert_path):
                 server.setcrl(f.read())
         t = threading.Thread(target=server.serve_forever)
         logger.info("Hosting CRL on %s:%d" %
-                    (socket.getfqdn(), common.CRL_PORT))
+                    (socket.getfqdn(), config.CRL_PORT))
         t.start()
 
         def check_expiration():
             logger.info("checking CRL for expiration every hour")
-            while True:
+            while True:  # pylint: disable=R1702
                 try:
-                    if os.path.exists('cacrl.der'):
-                        retout = cmd_exec.run(
-                            "openssl crl -inform der -in cacrl.der -text -noout", lock=False)['retout']
+                    if (os.path.exists('cacrl.der') and
+                            os.stat('cacrl.der').st_size):
+                        cmd = ('openssl', 'crl', '-inform', 'der', '-in',
+                               'cacrl.der', '-text', '-noout')
+                        retout = cmd_exec.run(cmd)['retout']
                         for line in retout:
                             line = line.strip()
                             if line.startswith(b"Next Update:"):
                                 expire = datetime.datetime.strptime(
                                     line[13:].decode('utf-8'), "%b %d %H:%M:%S %Y %Z")
                                 # check expiration within 6 hours
-                                in1hour = datetime.datetime.utcnow()+datetime.timedelta(hours=6)
+                                in1hour = datetime.datetime.utcnow() + datetime.timedelta(hours=6)
                                 if expire <= in1hour:
                                     logger.info(
                                         "Certificate to expire soon %s, re-issuing" % expire)
@@ -440,8 +438,7 @@ class ThreadedCRLServer(ThreadingMixIn, HTTPServer):
 
 class CRLHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        logger.info('GET invoked from ' +
-                    str(self.client_address) + ' with uri:' + self.path)
+        logger.info('GET invoked from ' + str(self.client_address) + ' with uri:' + self.path)
 
         if self.server.published_crl is None:
             self.send_response(404)
@@ -454,7 +451,6 @@ class CRLHandler(BaseHTTPRequestHandler):
 
 
 def rmfiles(path):
-    import glob
     files = glob.glob(path)
     for f in files:
         os.remove(f)
@@ -486,18 +482,18 @@ def read_private(warn=False):
         key = crypto.kdf(global_password, toread['salt'])
         try:
             plain = crypto.decrypt(toread['priv'], key)
-        except ValueError:
-            raise Exception("Invalid password for keystore")
+        except ValueError as e:
+            raise Exception("Invalid password for keystore") from e
 
         return yaml.load(plain, Loader=SafeLoader), toread['salt']
-    else:
-        if warn:
-            # file doesn't exist, just invent a salt
-            logger.warning("Private certificate data %s does not exist yet." %
-                           os.path.abspath("private.yml"))
-            logger.warning(
-                "Keylime will attempt to load private certificate data again when it is needed.")
-        return {'revoked_keys': []}, base64.b64encode(crypto.generate_random_key()).decode()
+
+    if warn:
+        # file doesn't exist, just invent a salt
+        logger.warning("Private certificate data %s does not exist yet." %
+                       os.path.abspath("private.yml"))
+        logger.warning(
+            "Keylime will attempt to load private certificate data again when it is needed.")
+    return {'revoked_keys': []}, base64.b64encode(crypto.generate_random_key()).decode()
 
 
 def main(argv=sys.argv):
@@ -511,28 +507,14 @@ def main(argv=sys.argv):
     parser.add_argument('-i', '--insecure', action='store_true', default=False,
                         help='create cert packages with unprotected private keys and write them to disk.  USE WITH CAUTION!')
 
-    if common.DEVELOP_IN_ECLIPSE and len(argv) == 1:
-        argv = ['-c', 'init']
-        # argv=['-c','create','-n',socket.getfqdn()]
-        argv = ['-c', 'create', '-n', 'client']
-        # argv=['-c','pkg','-n','client']
-        argv = ['-c', 'revoke', '-n', 'client']
-        argv = ['-c', 'listen', '-d', 'ca']
-    else:
-        argv = argv[1:]
+    args = parser.parse_args(argv[1:])
 
-    # never prompt for passwords in development mode
-    if common.DEVELOP_IN_ECLIPSE:
-        setpassword('default')
-
-    args = parser.parse_args(argv)
-
-    if args.dir == None:
-        if os.getuid() != 0 and common.REQUIRE_ROOT:
+    if args.dir is None:
+        if os.getuid() != 0 and config.REQUIRE_ROOT:
             logger.error(
-                "If you don't specify a working directory, this process must be run as root to access %s" % common.WORK_DIR)
+                "If you don't specify a working directory, this process must be run as root to access %s" % config.WORK_DIR)
             sys.exit(-1)
-        workingdir = common.CA_WORK_DIR
+        workingdir = config.CA_WORK_DIR
     else:
         workingdir = args.dir
 

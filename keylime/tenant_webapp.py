@@ -1,37 +1,47 @@
 #!/usr/bin/python3
 
 '''
-SPDX-License-Identifier: Apache-2.0
+SPDX-License-Identifier: BSD-2-Clause
 Copyright 2017 Massachusetts Institute of Technology.
 '''
 
 import base64
-import functools
+import logging
 import os
 import ssl
 import traceback
 import sys
-try:
-    import simplejson as json
-except ImportError:
-    raise("Simplejson is mandatory, please install")
 
+import simplejson as json
 import tornado.ioloop
 import tornado.web
-from tornado import httpserver
-from tornado.httpclient import AsyncHTTPClient
-from tornado.httputil import url_concat
 
-# from keylime import httpclient_requests
-from keylime import tornado_requests
-from keylime import cloud_verifier_common
-from keylime import tenant
-from keylime import common
+from keylime.requests_client import RequestsClient
+from keylime.common import states
+from keylime import config
 from keylime import keylime_logging
+from keylime import tenant
+
 
 logger = keylime_logging.init_logging('tenant_webapp')
-config = common.get_config()
 tenant_templ = tenant.Tenant()
+my_cert, my_priv_key = tenant_templ.get_tls_context()
+cert = (my_cert, my_priv_key)
+if config.getboolean('general', "enable_tls"):
+    tls_enabled = True
+else:
+    tls_enabled = False
+    cert = ""
+    logger.warning(
+        "Warning: TLS is currently disabled, keys will be sent in the clear! This should only be used for testing.")
+
+verifier_ip = config.get('cloud_verifier', 'cloudverifier_ip')
+verifier_port = config.get('cloud_verifier', 'cloudverifier_port')
+verifier_base_url = f'{verifier_ip}:{verifier_port}'
+
+registrar_ip = config.get('registrar', 'registrar_ip')
+registrar_tls_port = config.get('registrar', 'registrar_tls_port')
+registrar_base_tls_url = f'{registrar_ip}:{registrar_tls_port}'
 
 
 class Agent_Init_Types:
@@ -49,37 +59,43 @@ class BaseHandler(tornado.web.RequestHandler):
             lines = []
             for line in traceback.format_exception(*kwargs["exc_info"]):
                 lines.append(line)
-            common.echo_json_response(self, status_code, self._reason, lines)
+            config.echo_json_response(self, status_code, self._reason, lines)
         else:
-            common.echo_json_response(self, status_code, self._reason)
+            config.echo_json_response(self, status_code, self._reason)
+
+    def data_received(self, chunk):
+        raise NotImplementedError()
 
 
 class MainHandler(tornado.web.RequestHandler):
     def head(self):
-        common.echo_json_response(
+        config.echo_json_response(
             self, 405, "Not Implemented: Use /webapp/, /agents/ or /logs/ interface instead")
 
     def get(self):
-        common.echo_json_response(
+        config.echo_json_response(
             self, 405, "Not Implemented: Use /webapp/, /agents/ or /logs/  interface instead")
 
     def put(self):
-        common.echo_json_response(
+        config.echo_json_response(
             self, 405, "Not Implemented: Use /webapp/, /agents/ or /logs/  interface instead")
 
     def post(self):
-        common.echo_json_response(
+        config.echo_json_response(
             self, 405, "Not Implemented: Use /webapp/, /agents/ or /logs/  interface instead")
 
     def delete(self):
-        common.echo_json_response(
+        config.echo_json_response(
             self, 405, "Not Implemented: Use /webapp/, /agents/ or /logs/  interface instead")
+
+    def data_received(self, chunk):
+        raise NotImplementedError()
 
 
 class WebAppHandler(BaseHandler):
     def head(self):
         """HEAD not supported"""
-        common.echo_json_response(self, 405, "HEAD not supported")
+        config.echo_json_response(self, 405, "HEAD not supported")
 
     def get(self):
         """This method handles the GET requests to retrieve status on agents for all agents in a Web-based GUI.
@@ -94,6 +110,14 @@ class WebAppHandler(BaseHandler):
         vtpm_policy = json.dumps(json.loads(
             config.get('tenant', 'vtpm_policy')), indent=2)
 
+        # Get default intervals for populating angents, updating agents and updating terminal
+        populate_agents_interval = json.dumps(json.loads(
+            config.get('webapp', 'populate_agents_interval')), indent=2)
+        update_agents_interval = json.dumps(json.loads(
+            config.get('webapp', 'update_agents_interval')), indent=2)
+        update_terminal_interval = json.dumps(json.loads(
+            config.get('webapp', 'update_terminal_interval')), indent=2)
+
         self.set_status(200)
         self.set_header('Content-Type', 'text/html')
         self.write(
@@ -104,12 +128,25 @@ class WebAppHandler(BaseHandler):
                     <meta charset='UTF-8'>
                     <title>Advanced Tenant Management System</title>
                     <script type='text/javascript' src='/static/js/webapp.js'></script>
+                    <script type='text/javascript'>
+                        window.onload = function(e) {{
+                            let droppable = document.getElementsByClassName("file_drop");
+                            for (let i = 0; i < droppable.length; i++) {{
+                                droppable[i].addEventListener('dragover', dragoverCallback, false);
+                                droppable[i].addEventListener('drop', fileUploadCallback, false);
+                            }}
+                            populateAgents();
+                            setInterval(populateAgents, {0});
+                            setInterval(updateAgentsInfo, {1});
+                            setInterval(updateTerminal, {2});
+                        }}
+                    </script>
                     <link href='/static/css/webapp.css' rel='stylesheet' type='text/css'/>
                 </head>
                 <body>
-                    <div id='modal_box' onclick="if (event.target == this) {toggleVisibility(this.id);resetAddAgentForm();return false;}">
+                    <div id='modal_box' onclick="if (event.target == this) {{toggleVisibility(this.id);resetAddAgentForm();return false;}}">
 
-            """
+            """.format(populate_agents_interval, update_agents_interval, update_terminal_interval)
         )
 
         self.write(
@@ -278,48 +315,50 @@ class WebAppHandler(BaseHandler):
             """
         )
 
+    def data_received(self, chunk):
+        raise NotImplementedError()
+
 
 class AgentsHandler(BaseHandler):
     def head(self):
         """HEAD not supported"""
-        common.echo_json_response(self, 405, "HEAD not supported")
+        config.echo_json_response(self, 405, "HEAD not supported")
 
     async def get_agent_state(self, agent_id):
         try:
-            res = tornado_requests.request("GET",
-                                        "http://%s:%s/agents/%s"%(tenant_templ.cloudverifier_ip,tenant_templ.cloudverifier_port,agent_id),context=tenant_templ.cloudverifier_context)
-            response = await res
+            get_agent_state = RequestsClient(verifier_base_url, tls_enabled)
+            response = get_agent_state.get(
+                (f'/agents/{agent_id}'),
+                cert=cert,
+                verify=False
+            )
 
         except Exception as e:
-            logger.error("Status command response: %s:%s Unexpected response from Cloud Verifier." % (
-                tenant_templ.cloudverifier_ip, tenant_templ.cloudverifier_port))
+            logger.error("Status command response: %s:%s Unexpected response from Cloud Verifier.",
+                tenant_templ.cloudverifier_ip, tenant_templ.cloudverifier_port)
             logger.exception(e)
-            common.echo_json_response(
+            config.echo_json_response(
                 self, 500, "Unexpected response from Cloud Verifier", str(e))
-            logger.error("Unexpected response from Cloud Verifier: ", str(e))
+            logger.error("Unexpected response from Cloud Verifier: %s", e)
             return
 
         inst_response_body = response.json()
 
         if response.status_code != 200 and response.status_code != 404:
-            logger.error(
-                "Status command response: %d Unexpected response from Cloud Verifier." % response.status_code)
+            logger.error("Status command response: %d Unexpected response from Cloud Verifier.", response.status_code)
             keylime_logging.log_http_response(
                 logger, logging.ERROR, inst_response_body)
             return None
 
         if "results" not in inst_response_body:
-            logger.critical("Error: unexpected http response body from Cloud Verifier: %s" % str(
-                response.status_code))
+            logger.critical("Error: unexpected http response body from Cloud Verifier: %s", response.status_code)
             return None
 
         # Agent not added to CV (but still registered)
         if response.status_code == 404:
-            return {"operational_state": cloud_verifier_common.CloudAgent_Operational_State.REGISTERED}
-        else:
-            return inst_response_body["results"]
+            return {"operational_state": states.REGISTERED}
 
-        return None
+        return inst_response_body["results"]
 
     async def get(self):
         """This method handles the GET requests to retrieve status on agents from the WebApp.
@@ -328,9 +367,9 @@ class AgentsHandler(BaseHandler):
         will return errors.
         """
 
-        rest_params = common.get_restful_params(self.request.uri)
+        rest_params = config.get_restful_params(self.request.uri)
         if rest_params is None:
-            common.echo_json_response(
+            config.echo_json_response(
                 self, 405, "Not Implemented: Use /agents/ or /logs/ interface")
             return
 
@@ -341,14 +380,13 @@ class AgentsHandler(BaseHandler):
             # intercept requests for logs
             with open(keylime_logging.LOGSTREAM, 'r') as f:
                 logValue = f.readlines()
-                common.echo_json_response(self, 200, "Success", {
+                config.echo_json_response(self, 200, "Success", {
                                           'log': logValue[offset:]})
             return
-        elif "agents" not in rest_params:
+        if "agents" not in rest_params:
             # otherwise they must be looking for agent info
-            common.echo_json_response(self, 400, "uri not supported")
-            logger.warning(
-                'GET returning 400 response. uri not supported: ' + self.request.path)
+            config.echo_json_response(self, 400, "uri not supported")
+            logger.warning('GET returning 400 response. uri not supported: %s', self.request.path)
             return
 
         agent_id = rest_params["agents"]
@@ -357,35 +395,36 @@ class AgentsHandler(BaseHandler):
             agents = await self.get_agent_state(agent_id)
             agents["id"] = agent_id
 
-            common.echo_json_response(self, 200, "Success", agents)
+            config.echo_json_response(self, 200, "Success", agents)
             return
 
         # If no agent ID, get list of all agents from Registrar
         try:
-            res = tornado_requests.request("GET",
-                                        "http://%s:%s/agents/"%(tenant_templ.registrar_ip,tenant_templ.registrar_port),context=tenant_templ.registrar_context)
-            response = await res
+            get_agents = RequestsClient(registrar_base_tls_url, tls_enabled)
+            response = get_agents.get(
+                ('/agents/'),
+                cert=cert,
+                verify=False
+            )
 
         except Exception as e:
-            logger.error("Status command response: %s:%s Unexpected response from Registrar." % (
-                tenant_templ.registrar_ip, tenant_templ.registrar_port))
+            logger.error("Status command response: %s:%s Unexpected response from Registrar.",
+                tenant_templ.registrar_ip, tenant_templ.registrar_port)
             logger.exception(e)
-            common.echo_json_response(
+            config.echo_json_response(
                 self, 500, "Unexpected response from Registrar", str(e))
             return
 
         response_body = response.json()
 
         if response.status_code != 200:
-            logger.error(
-                "Status command response: %d Unexpected response from Registrar." % response.status_code)
+            logger.error("Status command response: %d Unexpected response from Registrar.", response.status_code)
             keylime_logging.log_http_response(
                 logger, logging.ERROR, response_body)
             return None
 
         if ("results" not in response_body) or ("uuids" not in response_body["results"]):
-            logger.critical("Error: unexpected http response body from Registrar: %s" % str(
-                response.status_code))
+            logger.critical("Error: unexpected http response body from Registrar: %s", response.status_code)
             return None
 
         agent_list = response_body["results"]["uuids"]
@@ -397,8 +436,7 @@ class AgentsHandler(BaseHandler):
 
         # Pre-create sorted agents list
         sorted_by_state = {}
-        states = cloud_verifier_common.CloudAgent_Operational_State.STR_MAPPINGS
-        for state in states:
+        for state in states.VALID_STATES:
             sorted_by_state[state] = {}
 
         # Build sorted agents list
@@ -406,13 +444,16 @@ class AgentsHandler(BaseHandler):
             state = agents[agent_id]["operational_state"]
             sorted_by_state[state][agent_id] = agents[agent_id]
 
-        print_order = [10, 9, 7, 3, 4, 5, 6, 2, 1, 8, 0]
+        print_order = [states.TENANT_FAILED, states.INVALID_QUOTE,
+                       states.FAILED, states.GET_QUOTE, states.GET_QUOTE_RETRY,
+                       states.PROVIDE_V, states.PROVIDE_V_RETRY, states.SAVED,
+                       states.START, states.TERMINATED, states.REGISTERED]
         sorted_agents = []
         for state in print_order:
             for agent_id in sorted_by_state[state]:
                 sorted_agents.append(agent_id)
 
-        common.echo_json_response(self, 200, "Success", {
+        config.echo_json_response(self, 200, "Success", {
                                   'uuids': sorted_agents})
 
     def delete(self):
@@ -422,16 +463,15 @@ class AgentsHandler(BaseHandler):
         agents requests require a single agent_id parameter which identifies the agent to be deleted.
         """
 
-        rest_params = common.get_restful_params(self.request.uri)
+        rest_params = config.get_restful_params(self.request.uri)
         if rest_params is None:
-            common.echo_json_response(
+            config.echo_json_response(
                 self, 405, "Not Implemented: Use /agents/ interface")
             return
 
         if "agents" not in rest_params:
-            common.echo_json_response(self, 400, "uri not supported")
-            logger.warning(
-                'DELETE returning 400 response. uri not supported: ' + self.request.path)
+            config.echo_json_response(self, 400, "uri not supported")
+            logger.warning('DELETE returning 400 response. uri not supported: %s', self.request.path)
             return
 
         agent_id = rest_params["agents"]
@@ -441,7 +481,7 @@ class AgentsHandler(BaseHandler):
         mytenant.agent_uuid = agent_id
         mytenant.do_cvdelete()
 
-        common.echo_json_response(self, 200, "Success")
+        config.echo_json_response(self, 200, "Success")
 
     def post(self):
         """This method handles the POST requests to add agents to the Cloud Verifier.
@@ -450,16 +490,15 @@ class AgentsHandler(BaseHandler):
         agents requests require a yaml block sent in the body
         """
 
-        rest_params = common.get_restful_params(self.request.uri)
+        rest_params = config.get_restful_params(self.request.uri)
         if rest_params is None:
-            common.echo_json_response(
+            config.echo_json_response(
                 self, 405, "Not Implemented: Use /agents/ interface")
             return
 
         if "agents" not in rest_params:
-            common.echo_json_response(self, 400, "uri not supported")
-            logger.warning(
-                'POST returning 400 response. uri not supported: ' + self.request.path)
+            config.echo_json_response(self, 400, "uri not supported")
+            logger.warning('POST returning 400 response. uri not supported: %s', self.request.path)
             return
 
         agent_id = rest_params["agents"]
@@ -497,7 +536,7 @@ class AgentsHandler(BaseHandler):
             if ca_dir_pw == "":
                 ca_dir_pw = 'default'
         else:
-            common.echo_json_response(self, 400, "invalid payload type chosen")
+            config.echo_json_response(self, 400, "invalid payload type chosen")
             logger.warning('POST returning 400 response. malformed query')
             return
 
@@ -550,12 +589,11 @@ class AgentsHandler(BaseHandler):
             mytenant.do_quote()
         except Exception as e:
             logger.exception(e)
-            logger.warning(
-                'POST returning 500 response. Tenant error: %s' % str(e))
-            common.echo_json_response(self, 500, "Request failure", str(e))
+            logger.warning('POST returning 500 response. Tenant error: %s', e)
+            config.echo_json_response(self, 500, "Request failure", str(e))
             return
 
-        common.echo_json_response(self, 200, "Success")
+        config.echo_json_response(self, 200, "Success")
 
     def put(self):
         """This method handles the PUT requests to add agents to the Cloud Verifier.
@@ -563,16 +601,15 @@ class AgentsHandler(BaseHandler):
         Currently, only agents resources are available for PUTing, i.e. /agents. All other PUT uri's will return errors.
         """
 
-        rest_params = common.get_restful_params(self.request.uri)
+        rest_params = config.get_restful_params(self.request.uri)
         if rest_params is None:
-            common.echo_json_response(
+            config.echo_json_response(
                 self, 405, "Not Implemented: Use /agents/ interface")
             return
 
         if "agents" not in rest_params:
-            common.echo_json_response(self, 400, "uri not supported")
-            logger.warning(
-                'PUT returning 400 response. uri not supported: ' + self.request.path)
+            config.echo_json_response(self, 400, "uri not supported")
+            logger.warning('PUT returning 400 response. uri not supported: %s', self.request.path)
             return
 
         agent_id = rest_params["agents"]
@@ -582,7 +619,10 @@ class AgentsHandler(BaseHandler):
         mytenant.agent_uuid = agent_id
         mytenant.do_cvreactivate()
 
-        common.echo_json_response(self, 200, "Success")
+        config.echo_json_response(self, 200, "Success")
+
+    def data_received(self, chunk):
+        raise NotImplementedError()
 
 
 def parse_data_uri(data_uri):
@@ -599,7 +639,7 @@ def parse_data_uri(data_uri):
 
         try:
             data.append(base64.b64decode(uri[fpos:]).decode('utf-8'))
-        except Exception as e:
+        except Exception:
             # skip bad data
             continue
 
@@ -608,25 +648,51 @@ def parse_data_uri(data_uri):
 
 def start_tornado(tornado_server, port):
     tornado_server.listen(port)
-    logger.info("Starting Torando on port " + str(port))
+    logger.info("Starting Torando on port %s", port)
     tornado.ioloop.IOLoop.instance().start()
     logger.info("Tornado finished")
 
 
-def main(argv=sys.argv):
+def get_tls_context():
+    ca_cert = config.get('tenant', 'ca_cert')
+
+    tls_dir = config.get('tenant', 'tls_dir')
+
+    if tls_dir == 'default':
+        ca_cert = 'cacert.crt'
+        tls_dir = 'cv_ca'
+
+    # this is relative path, convert to absolute in WORK_DIR
+    if tls_dir[0] != '/':
+        tls_dir = os.path.abspath('%s/%s' % (config.WORK_DIR, tls_dir))
+
+    logger.info("Setting up client TLS in %s", tls_dir)
+
+    ca_path = "%s/%s" % (tls_dir, ca_cert)
+    my_tls_cert = "%s/%s" % (tls_dir, my_cert)
+    my_tls_priv_key = "%s/%s" % (tls_dir, my_priv_key)
+
+    context = ssl.create_default_context()
+    context.load_verify_locations(cafile=ca_path)
+    context.load_cert_chain(
+        certfile=my_tls_cert, keyfile=my_tls_priv_key)
+    context.verify_mode = ssl.CERT_REQUIRED
+    context.check_hostname = config.getboolean(
+        'general', 'tls_check_hostnames')
+    return context
+
+
+def main():
     """Main method of the Tenant Webapp Server.  This method is encapsulated in a function for packaging to allow it to be
     called as a function by an external program."""
 
-    config = common.get_config()
-
     webapp_port = config.getint('webapp', 'webapp_port')
 
-    if not common.REQUIRE_ROOT and webapp_port < 1024:
+    if not config.REQUIRE_ROOT and webapp_port < 1024:
         webapp_port += 2000
-        logger.warn("Running without root, changing port to %d" % webapp_port)
+        logger.warning("Running without root, changing port to %d", webapp_port)
 
-    logger.info(
-        'Starting Tenant WebApp (tornado) on port %d use <Ctrl-C> to stop' % webapp_port)
+    logger.info('Starting Tenant WebApp (tornado) on port %d use <Ctrl-C> to stop', webapp_port)
 
     # Figure out where our static files are located
     if getattr(sys, 'frozen', False):
@@ -635,7 +701,7 @@ def main(argv=sys.argv):
     else:
         # instead try to locate static directory relative to script
         root_dir = os.path.dirname(os.path.abspath(__file__))
-    if not os.path.exists(root_dir+"/static/"):
+    if not os.path.exists(root_dir + "/static/"):
         raise Exception(
             'Static resource directory could not be found in %s!' % (root_dir))
 
@@ -644,14 +710,14 @@ def main(argv=sys.argv):
         (r"/(?:v[0-9]/)?agents/.*", AgentsHandler),
         (r"/(?:v[0-9]/)?logs/.*", AgentsHandler),
         (r'/static/(.*)', tornado.web.StaticFileHandler,
-         {'path': root_dir+"/static/"}),
+         {'path': root_dir + "/static/"}),
         (r".*", MainHandler),
     ])
 
     # WebApp Server TLS
-    server_context, x = tenant_templ.get_tls_context()
-    server_context.check_hostname = False # config.getboolean('general','tls_check_hostnames')
-    server_context.verify_mode = ssl.CERT_NONE # ssl.CERT_REQUIRED
+    server_context = get_tls_context()
+    server_context.check_hostname = False  # config.getboolean('general', 'tls_check_hostnames')
+    server_context.verify_mode = ssl.CERT_NONE  # ssl.CERT_REQUIRED
 
     # Set up server
     server = tornado.httpserver.HTTPServer(app, ssl_options=server_context)

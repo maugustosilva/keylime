@@ -33,7 +33,7 @@ def rsa_export_privkey(privkey):
 
 
 def rsa_generate(size):
-    return RSA.generate(2048)
+    return RSA.generate(size)
 
 
 def rsa_sign(key, message):
@@ -72,7 +72,7 @@ def strbitxor(a, b):
     a = bytearray(a)
     b = bytearray(b)
     retval = bytearray(len(b))
-    for i in range(len(a)):
+    for i, _ in enumerate(a):
         retval[i] = a[i] ^ b[i]
     return retval
 
@@ -110,7 +110,7 @@ def _pad(s):
     except AttributeError:
         pass
     pad_len = AES.block_size - (len(s) % AES.block_size) - 1
-    padding = b'\x80'+b'\0'*pad_len
+    padding = b'\x80' + b'\0' * pad_len
     return s + padding
 
 

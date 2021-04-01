@@ -6,10 +6,9 @@ Copyright 2017 Massachusetts Institute of Technology.
 import time
 
 from M2Crypto import X509, EVP, RSA, ASN1
-from keylime import common
-from keylime import keylime_logging
 
-config = common.get_config()
+from keylime import config
+from keylime import keylime_logging
 
 
 def mk_cert_valid(cert, days=365):
@@ -65,7 +64,7 @@ def mk_cacert(name=None):
     cert.set_version(2)
     mk_cert_valid(cert, config.getint('ca', 'cert_ca_lifetime'))
 
-    if name == None:
+    if name is None:
         name = config.get('ca', 'cert_ca_name')
 
     issuer = X509.X509_Name()
@@ -112,6 +111,7 @@ def mk_signed_cert(cacert, ca_pk, name, serialnum):
 
 
 def gencrl(_, a, b):
+    del a, b
     logger = keylime_logging.init_logging('ca_impl_openssl')
     logger.warning("CRL creation with openssl is not supported")
     return ""

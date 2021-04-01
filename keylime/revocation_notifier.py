@@ -10,18 +10,17 @@ import time
 import os
 import sys
 import signal
-import zmq
-try:
-    import simplejson as json
-except ImportError:
-    raise("Simplejson is mandatory, please install")
 
-from keylime import common
-from keylime import keylime_logging
+import simplejson as json
+import zmq
+
+from keylime import config
 from keylime import crypto
+from keylime import keylime_logging
+from keylime import secure_mount
+
 
 logger = keylime_logging.init_logging('revocation_notifier')
-config = common.get_config()
 broker_proc = None
 
 
@@ -48,6 +47,9 @@ def start_broker():
 def stop_broker():
     global broker_proc
     if broker_proc is not None:
+        # Remove the socket file before  we kill the process
+        if os.path.exists("/tmp/keylime.verifier.ipc"):
+            os.remove("/tmp/keylime.verifier.ipc")
         os.kill(broker_proc.pid, signal.SIGKILL)
 
 
@@ -58,8 +60,8 @@ def notify(tosend):
         mysock.connect("ipc:///tmp/keylime.verifier.ipc")
         # wait 100ms for connect to happen
         time.sleep(0.2)
-        # now send it out vi 0mq
-        logger.info("Sending revocation event to listening nodes..")
+        # now send it out via 0mq
+        logger.info("Sending revocation event to listening nodes...")
         for i in range(config.getint('cloud_verifier', 'max_retries')):
             try:
                 mysock.send_string(json.dumps(tosend))
@@ -123,8 +125,6 @@ def await_notifications(callback, revocation_cert_path):
 def main():
     start_broker()
 
-    from keylime import secure_mount
-
     def worker():
         def print_notification(revocation):
             logger.warning("Received revocation: %s" % revocation)
@@ -146,6 +146,7 @@ def main():
         'vtpm_policy': '{"ab":"1"}',
         'metadata': '{"cert_serial":"1"}',
         'allowlist': '{}',
+        'ima_sign_verification_keys': '{}',
         'revocation_key': '',
         'revocation': '{"cert_serial":"1"}',
     }

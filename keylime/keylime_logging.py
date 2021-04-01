@@ -3,10 +3,11 @@ SPDX-License-Identifier: Apache-2.0
 Copyright 2017 Massachusetts Institute of Technology.
 '''
 
-import os.path
-from keylime import common
-import sys
+import os
+
 import logging.config
+
+from keylime import config
 
 
 def log_http_response(logger, loglevel, response_body):
@@ -41,47 +42,33 @@ def log_http_response(logger, loglevel, response_body):
 LOG_TO_FILE = ['registrar', 'provider_registrar', 'cloudverifier']
 # not clear that this works right.  console logging may not work
 LOG_TO_STREAM = ['tenant_webapp']
-LOGDIR = '/var/log/keylime'
-if not common.REQUIRE_ROOT:
+LOGDIR = os.getenv('KEYLIME_LOGDIR', '/var/log/keylime')
+if not config.REQUIRE_ROOT:
     LOGSTREAM = './keylime-stream.log'
 else:
-    LOGSTREAM = LOGDIR+'/keylime-stream.log'
+    LOGSTREAM = LOGDIR + '/keylime-stream.log'
 
-logging.config.fileConfig(common.CONFIG_FILE)
+logging.config.fileConfig(config.CONFIG_FILE)
 
 
 def init_logging(loggername):
     logger = logging.getLogger("keylime.%s" % (loggername))
     logging.getLogger("requests").setLevel(logging.WARNING)
     mainlogger = logging.getLogger("keylime")
-
+    basic_formatter = logging.Formatter(
+        '%(asctime)s %(name)s %(levelname)s %(message)s')
     if loggername in LOG_TO_FILE:
-        if not common.REQUIRE_ROOT:
-            logfilename = "./keylime-all.log"
-        else:
-            logfilename = "%s/%s.log" % (LOGDIR, loggername)
-            if os.getuid() != 0:
-                logger.warning(
-                    "Unable to log to %s. please run as root" % logfilename)
-                return logger
-            else:
-                if not os.path.exists(LOGDIR):
-                    os.makedirs(LOGDIR, 0o750)
-                common.chownroot(LOGDIR, logger)
-                os.chmod(LOGDIR, 0o750)
-
+        logfilename = "%s/%s.log" % (LOGDIR, loggername)
+        if not os.path.exists(LOGDIR):
+            os.makedirs(LOGDIR, 0o750)
         fh = logging.FileHandler(logfilename)
         fh.setLevel(logger.getEffectiveLevel())
-        basic_formatter = logging.Formatter(
-            '%(created)s  %(name)s  %(levelname)s  %(message)s')
         fh.setFormatter(basic_formatter)
         mainlogger.addHandler(fh)
 
     if loggername in LOG_TO_STREAM:
         fh = logging.FileHandler(filename=LOGSTREAM, mode='w')
         fh.setLevel(logger.getEffectiveLevel())
-        basic_formatter = logging.Formatter(
-            '%(created)s  %(name)s  %(levelname)s  %(message)s')
         fh.setFormatter(basic_formatter)
         mainlogger.addHandler(fh)
 

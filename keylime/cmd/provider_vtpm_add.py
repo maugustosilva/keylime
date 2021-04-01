@@ -9,17 +9,15 @@ import sys
 import base64
 import yaml
 try:
-    from yaml import CSafeLoader as SafeLoader, CSafeDumper as SafeDumper
+    from yaml import CSafeLoader as SafeLoader
 except ImportError:
-    from yaml import SafeLoader as SafeLoader, SafeDumper as SafeDumper
+    from yaml import SafeLoader
 
-from keylime import common
+from keylime import config
 from keylime import keylime_logging
 from keylime import registrar_client
 from keylime import vtpm_manager
 
-# read the config file
-config = common.get_config()
 
 logger = keylime_logging.init_logging('platform-init')
 
@@ -53,11 +51,6 @@ def add_vtpm(inputfile):
 
 
 def main(argv=sys.argv):
-    if common.DEVELOP_IN_ECLIPSE and not common.STUB_TPM:
-        raise Exception("Can't use Xen features in Eclipse without STUB_TPM")
-
-    if common.DEVELOP_IN_ECLIPSE:
-        argv = ['provider_platform_register.py', 'current_group.tpm']
 
     if len(argv) < 2:
         print("usage: provider_vtpm_add.py [uuid].tpm")

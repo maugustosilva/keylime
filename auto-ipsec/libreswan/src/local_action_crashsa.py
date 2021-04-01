@@ -9,14 +9,11 @@ import os
 from M2Crypto import X509
 
 import keylime.secure_mount as secure_mount
-import keylime.common as common
+import keylime.config as common
 import keylime.keylime_logging as keylime_logging
 import keylime.cmd_exec as cmd_exec
 
-try:
-    import simplejson as json
-except ImportError:
-    raise("Simplejson is mandatory, please install")
+import simplejson as json
 
 # read the config file
 config = common.get_config()
@@ -35,12 +32,13 @@ async def execute(revocation):
     secdir = secure_mount.mount()
     logger.info(
         "loading updated CRL from %s/unzipped/cacrl.der into NSS" % secdir)
-    cmd_exec.run(
-        "crlutil -I -i %s/unzipped/cacrl.der -d sql:/etc/ipsec.d" % secdir, lock=False)
+    cmd = ('crlutil', '-I', '-i', '%s/unzipped/cacrl.der' % secdir,
+           '-d', 'sql:/etc/ipsec.d')
+    cmd_exec.run(cmd)
 
     # need to find any sa's that were established with that cert subject name
-    output = cmd_exec.run("ipsec whack --trafficstatus",
-                          lock=False, raiseOnError=True)['retout']
+    cmd = ('ipsec', 'whack', '--trafficstatus')
+    output = cmd_exec.run(cmd, raiseOnError=True)['retout']
     deletelist = set()
     id = ""
     for line in output:
@@ -76,5 +74,5 @@ async def execute(revocation):
 
     for todelete in deletelist:
         logger.info("deleting IPsec sa with %s" % todelete)
-        cmd_exec.run("ipsec whack --crash %s" %
-                     todelete, raiseOnError=False, lock=False)
+        cmd = ('ipsec', 'whack', '--crash', todelete)
+        cmd_exec.run(cmd, raiseOnError=False)

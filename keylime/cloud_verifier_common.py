@@ -1,88 +1,43 @@
-#!/usr/bin/python3
-
-'''
+"""
 SPDX-License-Identifier: Apache-2.0
 Copyright 2017 Massachusetts Institute of Technology.
-'''
+"""
 
 import ast
-from urllib.parse import urlparse
 import base64
-import time
 import os
 import ssl
 import socket
+import time
 
-try:
-    import simplejson as json
-except ImportError:
-    raise("Simplejson is mandatory, please install")
+import simplejson as json
 
-from keylime import common
+from keylime import config
 from keylime import keylime_logging
 from keylime import registrar_client
 from keylime import crypto
 from keylime import ca_util
 from keylime import revocation_notifier
-from keylime.tpm import tpm_obj
+from keylime.tpm.tpm_main import tpm
 from keylime.tpm.tpm_abstract import TPM_Utilities
-from keylime.utils import algorithms
+from keylime.common import algorithms
+from keylime import ima_file_signatures
 
 # setup logging
 logger = keylime_logging.init_logging('cloudverifier_common')
 
-# setup config
-config = common.get_config()
-
-
-class CloudAgent_Operational_State:
-    REGISTERED = 0
-    START = 1
-    SAVED = 2
-    GET_QUOTE = 3
-    GET_QUOTE_RETRY = 4
-    PROVIDE_V = 5
-    PROVIDE_V_RETRY = 6
-    FAILED = 7
-    TERMINATED = 8
-    INVALID_QUOTE = 9
-    TENANT_FAILED = 10
-
-    STR_MAPPINGS = {
-        0: "Registered",
-        1: "Start",
-        2: "Saved",
-        3: "Get Quote",
-        4: "Get Quote (retry)",
-        5: "Provide V",
-        6: "Provide V (retry)",
-        7: "Failed",
-        8: "Terminated",
-        9: "Invalid Quote",
-        10: "Tenant Quote Failed"
-    }
-
-
-class Timer(object):
-    def __init__(self, verbose=False):
-        self.verbose = verbose
-
-    def __enter__(self):
-        self.start = time.time()
-        return self
-
-    def __exit__(self, *args):
-        self.end = time.time()
-        self.secs = self.end - self.start
-        self.msecs = self.secs * 1000  # millisecs
-        if self.verbose:
-            print('elapsed time: %f ms' % self.msecs)
+GLOBAL_TPM_INSTANCE = None
+def get_tpm_instance():
+    global GLOBAL_TPM_INSTANCE
+    if GLOBAL_TPM_INSTANCE is None:
+        GLOBAL_TPM_INSTANCE = tpm()
+    return GLOBAL_TPM_INSTANCE
 
 
 def init_mtls(section='cloud_verifier', generatedir='cv_ca'):
     if not config.getboolean('general', "enable_tls"):
         logger.warning(
-            "TLS is currently disabled, keys will be sent in the clear! Should only be used for testing.")
+            "Warning: TLS is currently disabled, keys will be sent in the clear! This should only be used for testing.")
         return None
 
     logger.info("Setting up TLS...")
@@ -99,21 +54,18 @@ def init_mtls(section='cloud_verifier', generatedir='cv_ca'):
 
         if generatedir[0] != '/':
             generatedir = os.path.abspath(
-                '%s/%s' % (common.WORK_DIR, generatedir))
+                '%s/%s' % (config.WORK_DIR, generatedir))
         tls_dir = generatedir
         ca_path = "%s/cacert.crt" % (tls_dir)
         if os.path.exists(ca_path):
-            logger.info(
-                "Existing CA certificate found in %s, not generating a new one" % (tls_dir))
+            logger.info("Existing CA certificate found in %s, not generating a new one", tls_dir)
         else:
-            logger.info(
-                "Generating a new CA in %s and a client certificate for connecting" % tls_dir)
-            logger.info("use keylime_ca -d %s to manage this CA" % tls_dir)
+            logger.info("Generating a new CA in %s and a client certificate for connecting", tls_dir)
+            logger.info("use keylime_ca -d %s to manage this CA", tls_dir)
             if not os.path.exists(tls_dir):
                 os.makedirs(tls_dir, 0o700)
             if my_key_pw == 'default':
-                logger.warning(
-                    "CAUTION: using default password for CA, please set private_key_pw to a strong password")
+                logger.warning("CAUTION: using default password for CA, please set private_key_pw to a strong password")
             ca_util.setpassword(my_key_pw)
             ca_util.cmd_init(tls_dir)
             ca_util.cmd_mkcert(tls_dir, socket.gethostname())
@@ -123,35 +75,51 @@ def init_mtls(section='cloud_verifier', generatedir='cv_ca'):
         if section != 'registrar':
             raise Exception(
                 "You only use the CV option to tls_dir for the registrar not %s" % section)
-        tls_dir = os.path.abspath('%s/%s' % (common.WORK_DIR, 'cv_ca'))
+        tls_dir = os.path.abspath('%s/%s' % (config.WORK_DIR, 'cv_ca'))
         if not os.path.exists("%s/cacert.crt" % (tls_dir)):
             raise Exception(
                 "It appears that the verifier has not yet created a CA and certificates, please run the verifier first")
 
     # if it is relative path, convert to absolute in WORK_DIR
     if tls_dir[0] != '/':
-        tls_dir = os.path.abspath('%s/%s' % (common.WORK_DIR, tls_dir))
+        tls_dir = os.path.abspath('%s/%s' % (config.WORK_DIR, tls_dir))
 
     if ca_cert == 'default':
         ca_path = "%s/cacert.crt" % (tls_dir)
-    else:
+    elif not os.path.isabs(ca_cert):
         ca_path = "%s/%s" % (tls_dir, ca_cert)
+    else:
+        ca_path = ca_cert
 
     if my_cert == 'default':
         my_cert = "%s/%s-cert.crt" % (tls_dir, socket.gethostname())
-    else:
+    elif not os.path.isabs(my_cert):
         my_cert = "%s/%s" % (tls_dir, my_cert)
+    else:
+        pass
 
     if my_priv_key == 'default':
         my_priv_key = "%s/%s-private.pem" % (tls_dir, socket.gethostname())
-    else:
+    elif not os.path.isabs(my_priv_key):
         my_priv_key = "%s/%s" % (tls_dir, my_priv_key)
 
-    context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
-    context.load_verify_locations(cafile=ca_path)
-    context.load_cert_chain(
-        certfile=my_cert, keyfile=my_priv_key, password=my_key_pw)
-    context.verify_mode = ssl.CERT_REQUIRED
+    try:
+        context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+        context.load_verify_locations(cafile=ca_path)
+        context.load_cert_chain(
+            certfile=my_cert, keyfile=my_priv_key, password=my_key_pw)
+        if (config.has_option(section, 'check_client_cert')
+                and config.getboolean(section, 'check_client_cert')):
+            context.verify_mode = ssl.CERT_REQUIRED
+    except ssl.SSLError as exc:
+        if exc.reason == 'EE_KEY_TOO_SMALL':
+            logger.error('Higher key strength is required for keylime '
+                         'running on this system. If keylime is responsible '
+                         'to generate the certificate, please raise the value '
+                         'of configuration option [ca]cert_bits, remove '
+                         'generated certificate and re-run keylime service')
+        raise exc
+
     return context
 
 
@@ -162,48 +130,44 @@ def process_quote_response(agent, json_response):
     """
     received_public_key = None
     quote = None
-
     # in case of failure in response content do not continue
     try:
         received_public_key = json_response.get("pubkey", None)
         quote = json_response["quote"]
 
         ima_measurement_list = json_response.get("ima_measurement_list", None)
+        mb_measurement_list = json_response.get("mb_measurement_list", None)
 
-        logger.debug("received quote:      %s" % quote)
-        logger.debug("for nonce:           %s" % agent['nonce'])
-        logger.debug("received public key: %s" % received_public_key)
-        logger.debug("received ima_measurement_list    %s" %
-                     (ima_measurement_list is not None))
+        logger.debug("received quote:      %s", quote)
+        logger.debug("for nonce:           %s", agent['nonce'])
+        logger.debug("received public key: %s", received_public_key)
+        logger.debug("received ima_measurement_list    %s", (ima_measurement_list is not None))
+        logger.debug("received boot log    %s", (mb_measurement_list is not None))
     except Exception:
         return None
 
     # if no public key provided, then ensure we have cached it
     if received_public_key is None:
         if agent.get('public_key', "") == "" or agent.get('b64_encrypted_V', "") == "":
-            logger.error(
-                "agent did not provide public key and no key or encrypted_v was cached at CV")
+            logger.error("agent did not provide public key and no key or encrypted_v was cached at CV")
             return False
         agent['provide_V'] = False
         received_public_key = agent['public_key']
 
     if agent.get('registrar_keys', "") == "":
-        registrar_client.init_client_tls(config, 'cloud_verifier')
-        registrar_keys = registrar_client.getKeys(config.get("registrar", "registrar_ip"), config.get(
-            "registrar", "registrar_tls_port"), agent['agent_id'])
+        registrar_client.init_client_tls('cloud_verifier')
+        registrar_keys = registrar_client.getKeys(config.get("cloud_verifier", "registrar_ip"), config.get(
+            "cloud_verifier", "registrar_port"), agent['agent_id'])
         if registrar_keys is None:
             logger.warning("AIK not found in registrar, quote not validated")
             return False
         agent['registrar_keys'] = registrar_keys
 
-    tpm_version = json_response.get('tpm_version')
-    tpm = tpm_obj.getTPM(need_hw_tpm=False, tpm_version=tpm_version)
     hash_alg = json_response.get('hash_alg')
     enc_alg = json_response.get('enc_alg')
     sign_alg = json_response.get('sign_alg')
 
     # Update chosen tpm and algorithms
-    agent['tpm_version'] = tpm_version
     agent['hash_alg'] = hash_alg
     agent['enc_alg'] = enc_alg
     agent['sign_alg'] = sign_alg
@@ -223,27 +187,20 @@ def process_quote_response(agent, json_response):
         raise Exception(
             "TPM Quote is using an unaccepted signing algorithm: %s" % sign_alg)
 
-    if tpm.is_deep_quote(quote):
-        validQuote = tpm.check_deep_quote(agent['agent_id'],
-                                          agent['nonce'],
-                                          received_public_key,
-                                          quote,
-                                          agent['registrar_keys']['aik'],
-                                          agent['registrar_keys']['provider_keys']['aik'],
-                                          agent['vtpm_policy'],
-                                          agent['tpm_policy'],
-                                          ima_measurement_list,
-                                          agent['allowlist'])
-    else:
-        validQuote = tpm.check_quote(agent['agent_id'],
-                                     agent['nonce'],
-                                     received_public_key,
-                                     quote,
-                                     agent['registrar_keys']['aik'],
-                                     agent['tpm_policy'],
-                                     ima_measurement_list,
-                                     agent['allowlist'],
-                                     hash_alg)
+    ima_keyring = ima_file_signatures.ImaKeyring.from_string(agent['ima_sign_verification_keys'])
+    validQuote = get_tpm_instance().check_quote(
+        agent['agent_id'],
+        agent['nonce'],
+        received_public_key,
+        quote,
+        agent['registrar_keys']['aik_tpm'],
+        agent['tpm_policy'],
+        ima_measurement_list,
+        agent['allowlist'],
+        hash_alg,
+        ima_keyring,
+        mb_measurement_list,
+        agent['mb_refstate'])
     if not validQuote:
         return False
 
@@ -263,8 +220,8 @@ def process_quote_response(agent, json_response):
 
 def prepare_v(agent):
     # be very careful printing K, U, or V as they leak in logs stored on unprotected disks
-    if common.INSECURE_DEBUG:
-        logger.debug("b64_V (non encrypted): " + agent['v'])
+    if config.INSECURE_DEBUG:
+        logger.debug("b64_V (non encrypted): %s", agent['v'])
 
     if agent.get('b64_encrypted_V', "") != "":
         b64_encrypted_V = agent['b64_encrypted_V']
@@ -307,6 +264,18 @@ def process_get_status(agent):
         al_len = len(allowlist['allowlist'])
     else:
         al_len = 0
+
+    try :
+        mb_refstate = ast.literal_eval(agent.mb_refstate)
+    except Exception as e:
+        logger.warning('Non-fatal problem ocurred while attempting to evaluate agent attribute "mb_refstate" (%s). Will just consider the value of this attribute to be "None"', e.args)
+        mb_refstate = None
+        logger.debug('The contents of the agent attribute "mb_refstate" are %s', agent.mb_refstate)
+
+    if isinstance(mb_refstate, dict) and 'mb_refstate' in mb_refstate:
+        mb_refstate_len = len(mb_refstate['mb_refstate'])
+    else:
+        mb_refstate_len = 0
     response = {'operational_state': agent.operational_state,
                 'v': agent.v,
                 'ip': agent.ip,
@@ -315,7 +284,7 @@ def process_get_status(agent):
                 'vtpm_policy': agent.vtpm_policy,
                 'meta_data': agent.meta_data,
                 'allowlist_len': al_len,
-                'tpm_version': agent.tpm_version,
+                'mb_refstate_len': mb_refstate_len,
                 'accept_tpm_hash_algs': agent.accept_tpm_hash_algs,
                 'accept_tpm_encryption_algs': agent.accept_tpm_encryption_algs,
                 'accept_tpm_signing_algs': agent.accept_tpm_signing_algs,
@@ -325,23 +294,6 @@ def process_get_status(agent):
                 }
     return response
 
-
-def get_query_tag_value(path, query_tag):
-    """This is a utility method to query for specific the http parameters in the uri.
-
-    Returns the value of the parameter, or None if not found."""
-    data = {}
-    parsed_path = urlparse(path)
-    query_tokens = parsed_path.query.split('&')
-    # find the 'ids' query, there can only be one
-    for tok in query_tokens:
-        query_tok = tok.split('=')
-        query_key = query_tok[0]
-        if query_key is not None and query_key == query_tag:
-            # ids tag contains a comma delimited list of ids
-            data[query_tag] = query_tok[1]
-            break
-    return data.get(query_tag, None)
 
 # sign a message with revocation key.  telling of verification problem
 
@@ -371,6 +323,7 @@ def notify_error(agent, msgtype='revocation'):
         tosend['signature'] = "none"
     revocation_notifier.notify(tosend)
 
+
 def validate_agent_data(agent_data):
     if agent_data is None:
         return False, None
@@ -379,7 +332,7 @@ def validate_agent_data(agent_data):
     lists = json.loads(agent_data['allowlist'])
 
     # Validate exlude list contains valid regular expressions
-    is_valid, _, err_msg = common.valid_exclude_list(lists.get('exclude'))
+    is_valid, _, err_msg = config.valid_exclude_list(lists.get('exclude'))
     if not is_valid:
         err_msg += " Exclude list regex is misformatted. Please correct the issue and try again."
 

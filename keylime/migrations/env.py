@@ -1,14 +1,20 @@
+'''
+SPDX-License-Identifier: Apache-2.0
+Copyright 2017 Massachusetts Institute of Technology.
+
+Database migration
+'''
 import logging
 import re
+import sys
 
 from alembic import context
-
-import sys
-sys.path.append("..")
 
 from keylime.db.keylime_db import DBEngineManager
 from keylime.db.registrar_db import Base as RegistrarBase
 from keylime.db.verifier_db import Base as VerifierBase
+
+sys.path.append("..")
 
 USE_TWOPHASE = False
 
@@ -126,7 +132,7 @@ def run_migrations_online():
 
         for rec in engines.values():
             rec["transaction"].commit()
-    except:
+    except Exception:
         for rec in engines.values():
             rec["transaction"].rollback()
         raise
