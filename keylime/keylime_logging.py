@@ -43,7 +43,7 @@ LOG_TO_FILE = ['registrar', 'provider_registrar', 'cloudverifier']
 # not clear that this works right.  console logging may not work
 LOG_TO_STREAM = ['tenant_webapp']
 LOGDIR = os.getenv('KEYLIME_LOGDIR', '/var/log/keylime')
-if not config.REQUIRE_ROOT:
+if config.RUN_FROM_CWD:
     LOGSTREAM = './keylime-stream.log'
 else:
     LOGSTREAM = LOGDIR + '/keylime-stream.log'

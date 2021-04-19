@@ -135,7 +135,7 @@ class AbstractTPM(metaclass=ABCMeta):
 
     def __write_tpm_data(self):
         os.umask(0o077)
-        if os.geteuid() != 0 and config.REQUIRE_ROOT:
+        if os.geteuid() != 0 :
             logger.warning("Creating tpm metadata file without root. Sensitive trust roots may be at risk!")
         with open('tpmdata.yml', 'w') as f:
             yaml.dump(self.global_tpmdata, f, Dumper=SafeDumper)
@@ -363,7 +363,7 @@ class AbstractTPM(metaclass=ABCMeta):
     def init_system_rand(self):
         RNDADDENTROPY = 0x40085203
         rand_data = self._get_tpm_rand_block()
-        if config.REQUIRE_ROOT and rand_data is not None:
+        if rand_data is not None:
             try:
                 t = struct.pack("ii%ds" % len(rand_data), 8, len(rand_data), rand_data)
                 with open("/dev/random", mode='wb') as fp:

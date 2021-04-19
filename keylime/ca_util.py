@@ -510,10 +510,6 @@ def main(argv=sys.argv):
     args = parser.parse_args(argv[1:])
 
     if args.dir is None:
-        if os.getuid() != 0 and config.REQUIRE_ROOT:
-            logger.error(
-                "If you don't specify a working directory, this process must be run as root to access %s" % config.WORK_DIR)
-            sys.exit(-1)
         workingdir = config.CA_WORK_DIR
     else:
         workingdir = args.dir
