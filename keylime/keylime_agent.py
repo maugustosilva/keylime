@@ -379,7 +379,7 @@ class CloudAgentHTTPServer(ThreadingMixIn, HTTPServer):
             self.u_set.add(u)
 
     def add_V(self, v):
-        """Threadsafe method for adding a U value received from the Cloud Verifier
+        """Threadsafe method for adding a V value received from the Cloud Verifier
         Do not modify u_set of v_set directly.
         """
         with uvLock:
@@ -450,9 +450,9 @@ class CloudAgentHTTPServer(ThreadingMixIn, HTTPServer):
 
 
 def main():
-    if os.getuid() != 0 and config.REQUIRE_ROOT:
-        logger.critical("This process must be run as root.")
-        return
+    for ML in [ config.MEASUREDBOOT_ML, config.IMA_ML ] :
+        if not os.access(ML, os.F_OK) :
+            logger.warning("Measurement list path %s not accessible by agent. Any attempt to instruct it to access this path - via \"keylime_tenant\" CLI - will result in agent process dying", ML)
 
     if config.get('cloud_agent', 'agent_uuid') == 'dmidecode':
         if os.getuid() != 0:
@@ -526,12 +526,14 @@ def main():
         registrar_ip, registrar_port, agent_uuid, ek_tpm, ekcert, aik_tpm)
 
     if keyblob is None:
+        instance_tpm.flush_keys()
         raise Exception("Registration failed")
 
     # get the ephemeral registrar key
     key = instance_tpm.activate_identity(keyblob)
 
     if key is None:
+        instance_tpm.flush_keys()
         raise Exception("Activation failed")
 
     # tell the registrar server we know the key
@@ -540,6 +542,7 @@ def main():
         registrar_ip, registrar_port, agent_uuid, key)
 
     if not retval:
+        instance_tpm.flush_keys()
         raise Exception("Registration failed on activate")
 
     serveraddr = (config.get('cloud_agent', 'cloudagent_ip'),

@@ -23,7 +23,6 @@ from keylime import keylime_logging
 from keylime import crypto
 from keylime import ima
 from keylime.common import algorithms
-from keylime.elchecking import policies as eventlog_policies
 
 logger = keylime_logging.init_logging('tpm')
 
@@ -60,7 +59,7 @@ class TPM_Utilities:
             if int(key) == config.IMA_PCR:
                 raise Exception("Invalid allowlist PCR number %s, this PCR is used for IMA." % key)
 
-            mask = mask + (1 << int(key))
+            mask = mask | (1 << int(key))
 
             # wrap it in a list if it is a singleton
             if isinstance(policy[key], str):
@@ -235,6 +234,9 @@ class AbstractTPM(metaclass=ABCMeta):
 
         if mb_refstate_data :
             mb_policy_name = config.MEASUREDBOOT_POLICYNAME
+            #pylint: disable=import-outside-toplevel
+            from keylime.elchecking import policies as eventlog_policies
+            #pylint: enable=import-outside-toplevel
             mb_policy = eventlog_policies.get_policy(mb_policy_name)
             if mb_policy is None:
                 logger.warning(
