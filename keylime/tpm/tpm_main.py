@@ -506,6 +506,11 @@ class tpm(tpm_abstract.AbstractTPM):
             owner_pw = config_pw
 
         if self.tools_version == "3.2":
+            retDict = self.__run(["tpm2_flushcontext", "-s"], raiseOnError=False)
+        elif self.tools_version in ["4.0", "4.2"]:
+            retDict = self.__run(["tpm2_flushcontext", "-s"], raiseOnError=False)
+
+        if self.tools_version == "3.2":
             retDict = self.__run(["tpm2_takeownership", "-c"], raiseOnError=False)
             retDict = self.__run(["tpm2_takeownership", "-o", owner_pw, "-e", owner_pw],
                                  raiseOnError=False)
