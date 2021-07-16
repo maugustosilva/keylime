@@ -227,7 +227,7 @@ class AbstractTPM(metaclass=ABCMeta):
         pcr_allowlist = {int(k): v for k, v in list(pcr_allowlist.items())}
 
         mb_policy, mb_refstate_data = measured_boot.get_policy(mb_refstate_str)
-        mb_pcrs_sha256, mb_measurement_data, success = self.parse_mb_bootlog(mb_measurement_list)
+        mb_pcrs_sha256, boot_agregates, mb_measurement_data, success = self.parse_mb_bootlog(mb_measurement_list)
         if not success:
             return False
 
