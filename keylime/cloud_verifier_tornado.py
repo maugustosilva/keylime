@@ -23,16 +23,15 @@ from keylime.db.keylime_db import DBEngineManager, SessionManager
 from keylime import keylime_logging
 from keylime import cloud_verifier_common
 from keylime import revocation_notifier
-import keylime.tornado_requests as tornado_requests
-
+from keylime import tornado_requests
 
 logger = keylime_logging.init_logging('cloudverifier')
 
 
 try:
     engine = DBEngineManager().make_engine('cloud_verifier')
-except SQLAlchemyError as e:
-    logger.error('Error creating SQL engine or session: %s', e)
+except SQLAlchemyError as err:
+    logger.error('Error creating SQL engine or session: %s', err)
     sys.exit(1)
 
 
@@ -43,7 +42,7 @@ def get_session():
 # The "exclude_db" dict values are removed from the response before adding the dict to the DB
 # This is because we want these values to remain ephemeral and not stored in the database.
 exclude_db = {
-    'registrar_keys': '',
+    'registrar_data': '',
     'nonce': '',
     'b64_encrypted_V': '',
     'provide_V': True,
