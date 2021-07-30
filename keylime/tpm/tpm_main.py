@@ -250,8 +250,8 @@ class tpm(tpm_abstract.AbstractTPM):
         retDict = self.__run(["tpm2_startup", "--version"])
 
         code = retDict['code']
-        output = ''.join(config.list_convert(retDict['retout']))
-        errout = ''.join(config.list_convert(retDict['reterr']))
+        output = ''.join(config.convert(retDict['retout']))
+        errout = ''.join(config.convert(retDict['reterr']))
         if code != tpm_abstract.AbstractTPM.EXIT_SUCESS:
             raise Exception("Error establishing tpm2-tools version using TPM2_Startup: %s" + str(code) + ": " + str(errout))
 
@@ -279,8 +279,8 @@ class tpm(tpm_abstract.AbstractTPM):
         elif self.tools_version in ["4.0", "4.2"]:
             retDict = self.__run(["tpm2_getcap", "algorithms"])
 
-        output = config.list_convert(retDict['retout'])
-        errout = config.list_convert(retDict['reterr'])
+        output = config.convert(retDict['retout'])
+        errout = config.convert(retDict['reterr'])
         code = retDict['code']
 
         if code != tpm_abstract.AbstractTPM.EXIT_SUCESS:
@@ -383,7 +383,7 @@ class tpm(tpm_abstract.AbstractTPM):
     # tpm_initialize
     def __startup_tpm(self):
         retDict = self.__run(['tpm2_startup', '-c'])
-        errout = config.list_convert(retDict['reterr'])
+        errout = config.convert(retDict['reterr'])
         code = retDict['code']
         if code != tpm_abstract.AbstractTPM.EXIT_SUCESS:
             raise Exception("Error initializing emulated TPM with TPM2_Startup: %s" + str(code) + ": " + str(errout))
@@ -583,8 +583,8 @@ class tpm(tpm_abstract.AbstractTPM):
                 logger.info("Flushing old ak handle: %s" % aik_handle)
                 retDict = self.__run(["tpm2_getcap", "handles-persistent"],
                                      raiseOnError=False)
-            output = config.list_convert(retDict['retout'])
-            errout = config.list_convert(retDict['reterr'])
+            output = config.convert(retDict['retout'])
+            errout = config.convert(retDict['reterr'])
             code = retDict['code']
 
             if code != tpm_abstract.AbstractTPM.EXIT_SUCESS:
@@ -690,8 +690,8 @@ class tpm(tpm_abstract.AbstractTPM):
         elif self.tools_version in ["4.0", "4.2"]:
             retDict = self.__run(["tpm2_getcap", "handles-persistent"])
         # retout = retDict['retout']
-        retout = config.list_convert(retDict['retout'])
-        errout = config.list_convert(retDict['reterr'])
+        retout = config.convert(retDict['retout'])
+        errout = config.convert(retDict['reterr'])
         code = retDict['code']
 
         if code != tpm_abstract.AbstractTPM.EXIT_SUCESS:
@@ -1071,7 +1071,7 @@ class tpm(tpm_abstract.AbstractTPM):
 
         return retout, True
 
-    def check_quote(self, agent_id, nonce, data, quote, aikTpmFromRegistrar, tpm_policy={}, ima_measurement_list=None, allowlist={}, hash_alg=None, ima_keyring=None, mb_measurement_list=None, mb_refstate=None):
+    def check_quote(self, agentAttestState, nonce, data, quote, aikTpmFromRegistrar, tpm_policy={}, ima_measurement_list=None, allowlist={}, hash_alg=None, ima_keyring=None, mb_measurement_list=None, mb_refstate=None):
         if hash_alg is None:
             hash_alg = self.defaults['hash']
 
@@ -1097,7 +1097,7 @@ class tpm(tpm_abstract.AbstractTPM):
         if len(pcrs) == 0:
             pcrs = None
 
-        return self.check_pcrs(agent_id, tpm_policy, pcrs, data, False, ima_measurement_list, allowlist, ima_keyring, mb_measurement_list, mb_refstate)
+        return self.check_pcrs(agentAttestState, tpm_policy, pcrs, data, False, ima_measurement_list, allowlist, ima_keyring, mb_measurement_list, mb_refstate)
 
     def sim_extend(self, hashval_1, hashval_0=None):
         # simulate extending a PCR value by performing TPM-specific extend procedure
@@ -1120,9 +1120,9 @@ class tpm(tpm_abstract.AbstractTPM):
         if hash_alg is None:
             hash_alg = self.defaults['hash']
         if self.tools_version == "3.2":
-            output = config.list_convert(self.__run("tpm2_pcrlist")['retout'])
+            output = config.convert(self.__run("tpm2_pcrlist")['retout'])
         elif self.tools_version in ["4.0", "4.2"]:
-            output = config.list_convert(self.__run("tpm2_pcrread")['retout'])
+            output = config.convert(self.__run("tpm2_pcrread")['retout'])
 
         jsonout = config.yaml_to_dict(output)
 
@@ -1202,8 +1202,8 @@ class tpm(tpm_abstract.AbstractTPM):
             elif self.tools_version in ["4.0", "4.2"]:
                 retDict = self.__run(["tpm2_nvread", '0x1c00002', "-s", ekcert_size, "-o", nvpath.name],
                                      raiseOnError=False, outputpaths=nvpath.name)
-            output = config.list_convert(retDict['retout'])
-            errout = config.list_convert(retDict['reterr'])
+            output = config.convert(retDict['retout'])
+            errout = config.convert(retDict['reterr'])
             code = retDict['code']
             ekcert = retDict['fileouts'][nvpath.name]
 
@@ -1220,7 +1220,7 @@ class tpm(tpm_abstract.AbstractTPM):
             retDict = self.__run(["tpm2_nvread", "0x1500018", "-C", "0x40000001", "-s", str(config.BOOTSTRAP_KEY_SIZE), "-P", owner_pw], raiseOnError=False)
 
         output = retDict['retout']
-        errout = config.list_convert(retDict['reterr'])
+        errout = config.convert(retDict['reterr'])
         code = retDict['code']
 
         if code != tpm_abstract.AbstractTPM.EXIT_SUCESS:
@@ -1284,7 +1284,6 @@ class tpm(tpm_abstract.AbstractTPM):
                 if _boot_agg and _boot_agg not in log['boot_aggregates'][_hash_alg] :
                     log['boot_aggregates'][_hash_alg].append(_boot_agg)
                     _boot_agg = None
-        return
 
     def parse_binary_bootlog(self, log_bin:bytes) -> dict:
         '''Parse and enrich a BIOS boot log
@@ -1295,8 +1294,9 @@ class tpm(tpm_abstract.AbstractTPM):
         with tempfile.NamedTemporaryFile() as log_bin_file:
             log_bin_file.write(log_bin)
             log_bin_filename = log_bin_file.name
-
             retDict_tpm2 = self.__run(['tpm2_eventlog', '--eventlog-version=2', log_bin_filename])
+            # Unfortunately, in order to acommodate older kernels and older versions of grub (mixed)
+            # we are required to calculate boot aggregates taking into account PCRs 0-7 and 0-9
             for pcrno in [ "7", "9" ] :
                 retDict_tss.append(self.__run(['tsseventextend', '-sim', '-if',  log_bin_filename, '-pcrmax', pcrno]))
         log_parsed_strs = retDict_tpm2['retout']
@@ -1331,20 +1331,21 @@ class tpm(tpm_abstract.AbstractTPM):
             mb_measurement_data = self._parse_mb_bootlog(mb_measurement_list)
             if not mb_measurement_data:
                 logger.error("Unable to parse measured boot event log. Check previous messages for a reason for error.")
-                return {}, {}, {}, False
+                return {}, None, {}, False
             log_pcrs = mb_measurement_data.get('pcrs')
             if not isinstance(log_pcrs, dict):
                 logger.error("Parse of measured boot event log has unexpected value for .pcrs: %r", log_pcrs)
-                return {}, {}, {}, False
+                return {}, None, {}, False
             pcrs_sha256 = log_pcrs.get('sha256')
             if (not isinstance(pcrs_sha256, dict)) or not pcrs_sha256:
                 logger.error("Parse of measured boot event log has unexpected value for .pcrs.sha256: %r", pcrs_sha256)
-                return {}, {}, {}, False
-            boot_aggregates = mb_measurement_data.get('boot_agreggates')
-            if (not isinstance(mb_measurement_data, dict)) or not pcrs_sha256:
+                return {}, None, {}, False
+            boot_aggregates = mb_measurement_data.get('boot_aggregates')
+            if (not isinstance(boot_aggregates, dict)) or not boot_aggregates:
                 logger.error("Parse of measured boot event log has unexpected value for .boot_aggragtes: %r", boot_aggregates)
-                return {}, {}, {}, False
+                return {}, None, {}, False
 
             return pcrs_sha256, boot_aggregates, mb_measurement_data, True
 
-            return {}, {}, {}, True
+        return {}, None, {}, True
+

@@ -18,6 +18,7 @@ from keylime import registrar_client
 from keylime import crypto
 from keylime import ca_util
 from keylime import revocation_notifier
+from keylime.agentstates import AgentAttestStates
 from keylime.tpm.tpm_main import tpm
 from keylime.tpm.tpm_abstract import TPM_Utilities
 from keylime.common import algorithms
@@ -35,6 +36,10 @@ def get_tpm_instance():
     if GLOBAL_TPM_INSTANCE is None:
         GLOBAL_TPM_INSTANCE = tpm()
     return GLOBAL_TPM_INSTANCE
+
+
+def get_AgentAttestStates():
+    return AgentAttestStates.get_instance()
 
 
 def init_mtls(section='cloud_verifier', generatedir='cv_ca'):
@@ -126,7 +131,7 @@ def init_mtls(section='cloud_verifier', generatedir='cv_ca'):
     return context
 
 
-def process_quote_response(agent, json_response):
+def process_quote_response(agent, json_response, agentAttestState):
     """Validates the response from the Cloud agent.
 
     This method invokes an Registrar Server call to register, and then check the quote.
@@ -139,15 +144,25 @@ def process_quote_response(agent, json_response):
         quote = json_response["quote"]
 
         ima_measurement_list = json_response.get("ima_measurement_list", None)
+        ima_measurement_list_entry = json_response.get("ima_measurement_list_entry", 0)
         mb_measurement_list = json_response.get("mb_measurement_list", None)
+        boottime = json_response.get("boottime", 0)
 
         logger.debug("received quote:      %s", quote)
         logger.debug("for nonce:           %s", agent['nonce'])
         logger.debug("received public key: %s", received_public_key)
         logger.debug("received ima_measurement_list    %s", (ima_measurement_list is not None))
+        logger.debug("received ima_measurement_list_entry: %d", ima_measurement_list_entry)
+        logger.debug("received boottime: %s", boottime)
         logger.debug("received boot log    %s", (mb_measurement_list is not None))
     except Exception:
         return None
+
+    if not isinstance(ima_measurement_list_entry, int):
+        raise Exception("ima_measurement_list_entry parameter must be an integer")
+
+    if not isinstance(boottime, int):
+        raise Exception("boottime parameter must be an integer")
 
     # if no public key provided, then ensure we have cached it
     if received_public_key is None:
@@ -190,9 +205,26 @@ def process_quote_response(agent, json_response):
         raise Exception(
             "TPM Quote is using an unaccepted signing algorithm: %s" % sign_alg)
 
+    if ima_measurement_list_entry == 0:
+        agentAttestState.reset_ima_attestation()
+    elif ima_measurement_list_entry != agentAttestState.get_next_ima_ml_entry():
+        # If we requested a particular entry number then the agent must return either
+        # starting at 0 (handled above) or with the requested number.
+        raise Exception(
+            "Agent did not respond with requested next IMA measurement list entry %d but started at %d" %
+            (agentAttestState.get_next_ima_ml_entry(), ima_measurement_list_entry))
+    elif not agentAttestState.is_expected_boottime(boottime):
+        # agent sent a list not starting at 0 and provided a boottime that doesn't
+        # match the expected boottime, so it must have been rebooted; we would fail
+        # attestation this time so we retry with a full attestation next time.
+        agentAttestState.reset_ima_attestation()
+        return True
+
+    agentAttestState.set_boottime(boottime)
+
     ima_keyring = ima_file_signatures.ImaKeyring.from_string(agent['ima_sign_verification_keys'])
     validQuote = get_tpm_instance().check_quote(
-        agent['agent_id'],
+        agentAttestState,
         agent['nonce'],
         received_public_key,
         quote,
@@ -248,6 +280,7 @@ def prepare_get_quote(agent):
 
     This method is part of the polling loop of the thread launched on Tenant POST.
     """
+    agentAttestState = get_AgentAttestStates().get_by_agent_id(agent['agent_id'])
     agent['nonce'] = TPM_Utilities.random_password(20)
 
     tpm_policy = ast.literal_eval(agent['tpm_policy'])
@@ -257,6 +290,7 @@ def prepare_get_quote(agent):
         'nonce': agent['nonce'],
         'mask': tpm_policy['mask'],
         'vmask': vtpm_policy['mask'],
+        'ima_ml_entry': agentAttestState.get_next_ima_ml_entry(),
     }
     return params
 

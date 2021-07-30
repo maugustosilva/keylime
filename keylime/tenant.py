@@ -21,6 +21,7 @@ import requests
 
 from cryptography.hazmat.primitives import serialization as crypto_serialization
 
+from keylime.agentstates import AgentAttestState
 from keylime.requests_client import RequestsClient
 from keylime.common import states
 from keylime import config
@@ -37,6 +38,7 @@ from keylime.common import algorithms
 from keylime import ima_file_signatures
 from keylime import measured_boot
 from keylime import gpg
+from keylime import api_version as keylime_api_version
 
 # setup logging
 logger = keylime_logging.init_logging('tenant')
@@ -63,6 +65,8 @@ class Tenant():
 
     webapp_ip = None
     webapp_port = None
+
+    api_version = None
 
     uuid_service_generate_locally = None
     agent_uuid = None
@@ -102,6 +106,8 @@ class Tenant():
         if not config.REQUIRE_ROOT and self.webapp_port < 1024:
             self.webapp_port += 2000
         self.webapp_ip = config.get('webapp', 'webapp_ip')
+
+        self.api_version = keylime_api_version.current_version()
 
         self.my_cert, self.my_priv_key = self.get_tls_context()
         self.cert = (self.my_cert, self.my_priv_key)
@@ -498,7 +504,7 @@ class Tenant():
             logger.warning("AIK not found in registrar, quote not validated")
             return False
 
-        if not self.tpm_instance.check_quote(self.agent_uuid, self.nonce, public_key, quote, reg_data['aik_tpm'], hash_alg=hash_alg):
+        if not self.tpm_instance.check_quote(AgentAttestState(self.agent_uuid), self.nonce, public_key, quote, reg_data['aik_tpm'], hash_alg=hash_alg):
             if reg_data['regcount'] > 1:
                 logger.error("WARNING: This UUID had more than one ek-ekcert registered to it! This might indicate that your system is misconfigured or a malicious host is present. Run 'regdelete' for this agent and restart")
                 sys.exit()
@@ -581,7 +587,7 @@ class Tenant():
         json_message = json.dumps(data)
         do_cv = RequestsClient(self.verifier_base_url, self.tls_enabled)
         response = do_cv.post(
-            (f'/agents/{self.agent_uuid}'),
+            (f'/v{self.api_version}/agents/{self.agent_uuid}'),
             data=json_message,
             cert=self.cert,
             verify=False
@@ -619,7 +625,7 @@ class Tenant():
         if listing and (self.verifier_id is not None):
             verifier_id = self.verifier_id
             response = do_cvstatus.get(
-                (f'/agents/?verifier={verifier_id}'),
+                (f'/v{self.api_version}/agents/?verifier={verifier_id}'),
                 cert=self.cert,
                 verify=False
             )
@@ -628,13 +634,13 @@ class Tenant():
             if self.verifier_id is not None:
                 verifier_id = self.verifier_id
             response = do_cvstatus.get(
-                (f'/agents/?bulk={bulk}&verifier={verifier_id}'),
+                (f'/v{self.api_version}/agents/?bulk={bulk}&verifier={verifier_id}'),
                 cert=self.cert,
                 verify=False
             )
         else:
             response = do_cvstatus.get(
-                (f'/agents/{agent_uuid}'),
+                (f'/v{self.api_version}/agents/{agent_uuid}'),
                 cert=self.cert,
                 verify=False
             )
@@ -672,9 +678,8 @@ class Tenant():
 
         return None
 
-    def do_cvdelete(self, verifier_check):
-        """Delete agent from Verifier
-        """
+    def do_cvdelete(self, verifier_check=True):
+        """Delete agent from Verifier."""
         if verifier_check:
             agent_json = self.do_cvstatus(listing=False, returnresponse=True)
             self.verifier_ip = agent_json["verifier_ip"]
@@ -682,7 +687,7 @@ class Tenant():
 
         do_cvdelete = RequestsClient(self.verifier_base_url, self.tls_enabled)
         response = do_cvdelete.delete(
-            (f'/agents/{self.agent_uuid}'),
+            (f'/v{self.api_version}/agents/{self.agent_uuid}'),
             cert=self.cert,
             verify=False
         )
@@ -700,12 +705,12 @@ class Tenant():
                 get_cvdelete = RequestsClient(
                     self.verifier_base_url, self.tls_enabled)
                 response = get_cvdelete.get(
-                    (f'/agents/{self.agent_uuid}'),
+                    (f'/v{self.api_version}/agents/{self.agent_uuid}'),
                     cert=self.cert,
                     verify=False
                 )
 
-                if response.status_code in (200, 404):
+                if response.status_code == 404:
                     deleted = True
                     break
                 time.sleep(.4)
@@ -736,9 +741,8 @@ class Tenant():
         registrar_client.doRegistrarDelete(
             self.registrar_ip, self.registrar_port, self.agent_uuid)
 
-    def do_cvreactivate(self, verifier_check):
-        """ Reactive Agent
-        """
+    def do_cvreactivate(self, verifier_check=True):
+        """Reactive Agent."""
         if verifier_check:
             agent_json = self.do_cvstatus(listing=False, returnresponse=True)
             self.verifier_ip = agent_json['verifier_ip']
@@ -747,7 +751,7 @@ class Tenant():
         do_cvreactivate = RequestsClient(
             self.verifier_base_url, self.tls_enabled)
         response = do_cvreactivate.put(
-            (f'/agents/{self.agent_uuid}/reactivate'),
+            f'/v{self.api_version}/agents/{self.agent_uuid}/reactivate',
             data=b'',
             cert=self.cert,
             verify=False
@@ -772,7 +776,7 @@ class Tenant():
     def do_cvstop(self):
         """ Stop declared active agent
         """
-        params = f'/agents/{self.agent_uuid}/stop'
+        params = f'/v{self.api_version}/agents/{self.agent_uuid}/stop'
         do_cvstop = RequestsClient(self.verifier_base_url, self.tls_enabled)
         response = do_cvstop.put(
             params,
@@ -808,7 +812,7 @@ class Tenant():
         # Note: We need a specific retry handler (perhaps in common), no point having localised unless we have too.
         while True:
             try:
-                params = '/quotes/identity?nonce=%s' % (self.nonce)
+                params = f'/v{self.api_version}/quotes/identity?nonce=%s' % (self.nonce)
                 cloudagent_base_url = f'{self.agent_ip}:{self.agent_port}'
                 do_quote = RequestsClient(cloudagent_base_url, tls_enabled=False)
                 response = do_quote.get(
@@ -892,7 +896,7 @@ class Tenant():
             u_json_message = json.dumps(data)
 
             # post encrypted U back to CloudAgent
-            params = '/keys/ukey'
+            params = f'/v{self.api_version}/keys/ukey'
             cloudagent_base_url = (
                 f'{self.agent_ip}:{self.agent_port}'
             )
@@ -932,7 +936,7 @@ class Tenant():
                 do_verify = RequestsClient(
                     cloudagent_base_url, tls_enabled=False)
                 response = do_verify.get(
-                    (f'/keys/verify?challenge={challenge}'),
+                    (f'/v{self.api_version}/keys/verify?challenge={challenge}'),
                     cert=self.cert,
                     verify=False
                 )
@@ -985,19 +989,19 @@ class Tenant():
         }
         body = json.dumps(data)
         cv_client = RequestsClient(self.verifier_base_url, self.tls_enabled)
-        response = cv_client.post(f'/allowlists/{allowlist_name}', data=body,
+        response = cv_client.post(f'/v{self.api_version}/allowlists/{allowlist_name}', data=body,
                                   cert=self.cert, verify=False)
         print(response.json())
 
     def do_delete_allowlist(self, name):
         cv_client = RequestsClient(self.verifier_base_url, self.tls_enabled)
-        response = cv_client.delete(f'/allowlists/{name}',
+        response = cv_client.delete(f'/v{self.api_version}/allowlists/{name}',
                                     cert=self.cert, verify=False)
         print(response.json())
 
     def do_show_allowlist(self, name):
         cv_client = RequestsClient(self.verifier_base_url, self.tls_enabled)
-        response = cv_client.get(f'/allowlists/{name}',
+        response = cv_client.get(f'/v{self.api_version}/allowlists/{name}',
                                  cert=self.cert, verify=False)
         print(f"Show allowlist command response: {response.status_code}.")
         print(response.json())
@@ -1119,8 +1123,8 @@ def main(argv=sys.argv):
             mytenant.agent_uuid = hashlib.sha256(
                 mytenant.agent_uuid).hexdigest()
     else:
-        logger.warning("Using default UUID D432FBB3-D2F1-4A97-9EF7-75BD81C00000")
-        mytenant.agent_uuid = "D432FBB3-D2F1-4A97-9EF7-75BD81C00000"
+        logger.warning("Using default UUID d432fbb3-d2f1-4a97-9ef7-75bd81c00000")
+        mytenant.agent_uuid = "d432fbb3-d2f1-4a97-9ef7-75bd81c00000"
 
     if config.STUB_VTPM and config.TPM_CANNED_VALUES is not None:
         # Use canned values for agent UUID

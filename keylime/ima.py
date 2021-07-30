@@ -17,6 +17,7 @@ from keylime import config
 from keylime import gpg
 from keylime import keylime_logging
 from keylime import ima_ast
+from keylime.agentstates import AgentAttestState
 
 
 logger = keylime_logging.init_logging('ima')
@@ -24,6 +25,50 @@ logger = keylime_logging.init_logging('ima')
 
 # The version of the allowlist format that is supported by this keylime release
 ALLOWLIST_CURRENT_VERSION = 1
+
+
+def get_from_nth_entry(filedata, nth_entry):
+    """ Get the measurement list starting at the n-th entry, starting with 0.
+        Also count the total number of entries by counting the newlines.
+    """
+    num_entries = 0
+    offset = 0
+    result = None
+    while True:
+        try:
+            if num_entries == nth_entry:
+                result = filedata[offset:]
+            o = filedata.index('\n', offset)
+            offset = o + 1
+            num_entries += 1
+        except ValueError:
+            break
+    return result, num_entries
+
+
+def read_measurement_list(filename, nth_entry):
+    """ Read the IMA measurement list starting from a given entry.
+        The entry may be of any value 0 <= entry <= entries_in_log where
+        entries_in_log + 1 indicates that the client wants to read the next entry
+        once available. If the entry is outside this range, the function will
+        automatically read from the 0-th entry.
+        This function returns the measurement list and the entry from where it
+        was read and the current number of entries in the file.
+    """
+    ml = None
+    num_entries = 0
+
+    if not os.path.exists(filename):
+        logger.warning("IMA measurement list not available: %s", filename)
+    else:
+        with open(filename, 'r') as f:
+            filedata = f.read()
+        ml, num_entries = get_from_nth_entry(filedata, nth_entry)
+        if nth_entry > num_entries:
+            nth_entry = 0
+            ml = filedata
+
+    return ml, nth_entry, num_entries
 
 
 def read_unpack(fd, fmt):
@@ -82,8 +127,8 @@ def _validate_ima_sig(exclude_regex, ima_keyring, allowlist, digest: ima_ast.Dig
     return valid_signature
 
 
-def process_measurement_list(lines, lists=None, m2w=None, pcrval=None, ima_keyring=None):
-    running_hash = ima_ast.START_HASH
+def _process_measurement_list(agentAttestState, lines, lists=None, m2w=None, pcrval=None, ima_keyring=None, boot_aggregates=None):
+    running_hash = agentAttestState.get_pcr_state(config.IMA_PCR)
     found_pcr = (pcrval is None)
     errors = {}
     pcrval_bytes = b''
@@ -99,6 +144,14 @@ def process_measurement_list(lines, lists=None, m2w=None, pcrval=None, ima_keyri
         allow_list = None
         exclude_list = None
 
+    if boot_aggregates :
+        if "boot_aggregate" not in allow_list :
+            allow_list["boot_aggregate"] = []
+        for alg in boot_aggregates.keys() :
+            for val in boot_aggregates[alg] :
+                if val not in allow_list["boot_aggregate"] :
+                    allow_list["boot_aggregate"].append(val)
+
     is_valid, compiled_regex, err_msg = config.valid_exclude_list(exclude_list)
     if not is_valid:
         # This should not happen as the exclude list has already been validated
@@ -113,7 +166,7 @@ def process_measurement_list(lines, lists=None, m2w=None, pcrval=None, ima_keyri
          }
     )
 
-    for line in lines:
+    for linenum, line in enumerate(lines):
         line = line.strip()
         if line == '':
             continue
@@ -130,6 +183,11 @@ def process_measurement_list(lines, lists=None, m2w=None, pcrval=None, ima_keyri
             if not found_pcr:
                 # End of list should equal pcr value
                 found_pcr = (running_hash == pcrval_bytes)
+                if found_pcr:
+                    logger.debug('Found match at linenum %s' % (linenum + 1))
+                    # We always want to have the very last line for the attestation, so
+                    # we keep the previous runninghash, which is not the last one!
+                    agentAttestState.update_ima_attestation(int(entry.pcr), running_hash, linenum + 1)
 
             # Keep old functionality for writing the parsed files with hashes into a file
             if m2w is not None and (type(entry.mode) in [ima_ast.Ima, ima_ast.ImaNg, ima_ast.ImaSig]):
@@ -138,6 +196,11 @@ def process_measurement_list(lines, lists=None, m2w=None, pcrval=None, ima_keyri
                 m2w.write(f"{hash_value} {path}\n")
         except ima_ast.ParserError:
             logger.error(f"Line was not parsable into a valid IMA entry: {line}")
+
+    # iterative attestation may send us no log; compare last know PCR 10 state
+    # against current PCR state
+    if not found_pcr:
+        found_pcr = (running_hash == pcrval_bytes)
 
     # check PCR value has been found
     if not found_pcr:
@@ -152,6 +215,19 @@ def process_measurement_list(lines, lists=None, m2w=None, pcrval=None, ima_keyri
         return None
 
     return codecs.encode(running_hash, 'hex').decode('utf-8')
+
+
+def process_measurement_list(agentAttestState, lines, lists=None, m2w=None, pcrval=None, ima_keyring=None, boot_aggregates=None):
+    result = None
+    try:
+        result = _process_measurement_list(agentAttestState, lines, lists=lists, m2w=m2w, pcrval=pcrval, ima_keyring=ima_keyring, boot_aggregates=boot_aggregates)
+    except:  # pylint: disable=try-except-raise
+        raise
+    finally:
+        if not result:
+            agentAttestState.reset_ima_attestation()
+
+    return result
 
 
 def process_allowlists(allowlist, exclude):
@@ -301,7 +377,7 @@ def main():
     lines = f.readlines()
 
     m2a = open('measure2allow.txt', "w")
-    digest = process_measurement_list(lines, lists, m2a)
+    digest = process_measurement_list(AgentAttestState('1'), lines, lists, m2a)
     print("final digest is %s" % digest)
     f.close()
     m2a.close()
@@ -311,7 +387,7 @@ def main():
     al_data = read_allowlist('measure2allow.txt')
     excl_data = read_excllist(exclude_path)
     lists2 = process_allowlists(al_data, excl_data)
-    process_measurement_list(lines, lists2)
+    process_measurement_list(AgentAttestState('2'), lines, lists2)
 
     print("done")
 
