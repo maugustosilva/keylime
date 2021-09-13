@@ -11,12 +11,17 @@ import sys
 import tempfile
 import threading
 import time
+import typing
 import zlib
 import codecs
 from distutils.version import StrictVersion
 
-import M2Crypto
+from cryptography import exceptions as crypto_exceptions
+from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import serialization as crypto_serialization
+from cryptography.hazmat.primitives.asymmetric import padding
+from cryptography import x509
+
 import simplejson as json
 
 from keylime import cmd_exec
@@ -27,6 +32,7 @@ from keylime.tpm import tpm_abstract
 from keylime import tpm_ek_ca
 from keylime.common import algorithms
 from keylime.tpm import tpm2_objects
+from keylime.failure import Failure, Component
 
 logger = keylime_logging.init_logging('tpm')
 
@@ -846,18 +852,33 @@ class tpm(tpm_abstract.AbstractTPM):
         """
         # openssl x509 -inform der -in certificate.cer -out certificate.pem
         try:
-            ek509 = M2Crypto.X509.load_cert_der_string(ekcert)
+            ek509 = x509.load_der_x509_certificate(
+                data=ekcert,
+                backend=default_backend(),
+            )
 
             trusted_certs = tpm_ek_ca.cert_loader()
             for cert in trusted_certs:
-                signcert = M2Crypto.X509.load_cert_string(cert)
-                if str(ek509.get_issuer()) != str(signcert.get_subject()):
+                signcert = x509.load_pem_x509_certificate(
+                    data=cert.encode(),
+                    backend=default_backend(),
+                )
+
+                if ek509.issuer.rfc4514_string() != signcert.subject.rfc4514_string():
                     continue
 
-                signkey = signcert.get_pubkey()
-                if ek509.verify(signkey) == 1:
-                    logger.debug("EK cert matched cert: %s" % cert)
-                    return True
+                try:
+                    signcert.public_key().verify(
+                        ek509.signature,
+                        ek509.tbs_certificate_bytes,
+                        padding.PKCS1v15(),
+                        ek509.signature_hash_algorithm,
+                    )
+                except crypto_exceptions.InvalidSignature:
+                    continue
+
+                logger.debug("EK cert matched cert: %s" % cert)
+                return True
         except Exception as e:
             # Log the exception so we don't lose the raw message
             logger.exception(e)
@@ -1071,13 +1092,18 @@ class tpm(tpm_abstract.AbstractTPM):
 
         return retout, True
 
-    def check_quote(self, agentAttestState, nonce, data, quote, aikTpmFromRegistrar, tpm_policy={}, ima_measurement_list=None, allowlist={}, hash_alg=None, ima_keyring=None, mb_measurement_list=None, mb_refstate=None):
+    def check_quote(self, agentAttestState, nonce, data, quote, aikTpmFromRegistrar, tpm_policy={},
+                    ima_measurement_list=None, allowlist={}, hash_alg=None, ima_keyring=None,
+                    mb_measurement_list=None, mb_refstate=None) -> Failure:
+        failure = Failure(Component.QUOTE_VALIDATION)
         if hash_alg is None:
             hash_alg = self.defaults['hash']
 
         retout, success = self._tpm2_checkquote(aikTpmFromRegistrar, quote, nonce, hash_alg)
         if not success:
-            return success
+            # If the quote validation fails we will skip all other steps therefore this failure is irrecoverable.
+            failure.add_event("quote_validation", {"message": "Quote validation using tpm2-tools", "data": retout}, False)
+            return failure
 
         pcrs = []
         jsonout = config.yaml_to_dict(retout)
@@ -1321,31 +1347,35 @@ class tpm(tpm_abstract.AbstractTPM):
         log_bin = base64.b64decode(log_b64, validate=True)
         return self.parse_binary_bootlog(log_bin)
 
-    def parse_mb_bootlog(self, mb_measurement_list:str) -> dict:
+    def parse_mb_bootlog(self, mb_measurement_list: str) -> typing.Tuple[dict, typing.Optional[dict], dict, Failure]:
         """ Parse the measured boot log and return its object and the state of the SHA256 PCRs
         :param mb_measurement_list: The measured boot measurement list
         :returns: Returns a map of the state of the SHA256 PCRs, measured boot data object and True for success
                   and False in case an error occurred
         """
+        failure = Failure(Component.MEASURED_BOOT, ["parser"])
         if mb_measurement_list:
+            #TODO add tagging for _parse_mb_bootlog
             mb_measurement_data = self._parse_mb_bootlog(mb_measurement_list)
             if not mb_measurement_data:
                 logger.error("Unable to parse measured boot event log. Check previous messages for a reason for error.")
-                return {}, None, {}, False
+                return {}, None, {}, failure
             log_pcrs = mb_measurement_data.get('pcrs')
             if not isinstance(log_pcrs, dict):
                 logger.error("Parse of measured boot event log has unexpected value for .pcrs: %r", log_pcrs)
-                return {}, None, {}, False
+                failure.add_event("invalid_pcrs", {"got": log_pcrs}, True)
+                return {}, None, {}, failure
             pcrs_sha256 = log_pcrs.get('sha256')
             if (not isinstance(pcrs_sha256, dict)) or not pcrs_sha256:
                 logger.error("Parse of measured boot event log has unexpected value for .pcrs.sha256: %r", pcrs_sha256)
-                return {}, None, {}, False
+                failure.add_event("invalid_pcrs_sha256", {"got": pcrs_sha256}, True)
+                return {}, None, {}, failure
             boot_aggregates = mb_measurement_data.get('boot_aggregates')
             if (not isinstance(boot_aggregates, dict)) or not boot_aggregates:
                 logger.error("Parse of measured boot event log has unexpected value for .boot_aggragtes: %r", boot_aggregates)
-                return {}, None, {}, False
+                failure.add_event("invalid_boot_aggregates", {"got": boot_aggregates}, True)
+                return {}, None, {}, failure
 
-            return pcrs_sha256, boot_aggregates, mb_measurement_data, True
+            return pcrs_sha256, boot_aggregates, mb_measurement_data, failure
 
-        return {}, None, {}, True
-
+        return {}, None, {}, failure
