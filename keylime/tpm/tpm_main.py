@@ -23,10 +23,9 @@ from cryptography.hazmat.primitives import serialization as crypto_serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography import x509
 
-import simplejson as json
-
 from keylime import cmd_exec
 from keylime import config
+from keylime import json
 from keylime import keylime_logging
 from keylime import secure_mount
 from keylime.tpm import tpm_abstract
@@ -40,9 +39,6 @@ logger = keylime_logging.init_logging('tpm')
 
 def _get_cmd_env():
     env = os.environ.copy()
-    lib_path = ""
-    if 'LD_LIBRARY_PATH' in env:
-        lib_path = env['LD_LIBRARY_PATH']
     if 'TPM2TOOLS_TCTI' not in env:
         # Don't clobber existing setting (if present)
         env['TPM2TOOLS_TCTI'] = 'device:/dev/tpmrm0'
@@ -50,8 +46,6 @@ def _get_cmd_env():
         # Other (not recommended) options are direct emulator and chardev communications:
         # env['TPM2TOOLS_TCTI'] = 'mssim:port=2321'
         # env['TPM2TOOLS_TCTI'] = 'device:/dev/tpm0'
-    env['PATH'] = env['PATH'] + ":%s" % config.TPM_TOOLS_PATH
-    env['LD_LIBRARY_PATH'] = lib_path + ":%s" % config.TPM_LIBS_PATH
     return env
 
 
@@ -249,7 +243,7 @@ class tpm(tpm_abstract.AbstractTPM):
             # Assume their defaults are sane?
             pass
 
-        self.defaults['hash'] = defaultHash
+        self.defaults['hash'] = algorithms.Hash(defaultHash)
         self.defaults['encrypt'] = defaultEncrypt
         self.defaults['sign'] = defaultSign
         self.defaults['ek_handle'] = ek_handle
@@ -302,7 +296,10 @@ class tpm(tpm_abstract.AbstractTPM):
             output = output.replace("clear", "0")
             output = [output]
 
-        retyaml = config.yaml_to_dict(output)
+        retyaml = config.yaml_to_dict(output, logger=logger)
+        if retyaml is None:
+            logger.warning("Could not read YAML output of tpm2_getcap.")
+            return
         for algorithm, details in retyaml.items():
             if details["asymmetric"] == 1 and details["object"] == 1 and algorithms.Encrypt.is_recognized(algorithm):
                 self.supported['encrypt'].add(algorithm)
@@ -420,7 +417,7 @@ class tpm(tpm_abstract.AbstractTPM):
             if code != tpm_abstract.AbstractTPM.EXIT_SUCESS:
                 raise Exception("tpm2_getcap failed with code " + str(code) + ": " + str(reterr))
 
-            outjson = config.yaml_to_dict(output)
+            outjson = config.yaml_to_dict(output, logger=logger)
             if outjson is not None and hex(current_handle) in outjson:
                 if self.tools_version == "3.2":
                     cmd = ["tpm2_evictcontrol", "-A", "o", "-H",
@@ -470,7 +467,9 @@ class tpm(tpm_abstract.AbstractTPM):
                 handle = int(0x81010007)
             elif self.tools_version in ["4.0", "4.2"]:
                 handle = None
-                retyaml = config.yaml_to_dict(output)
+                retyaml = config.yaml_to_dict(output, logger=logger)
+                if retyaml is None:
+                    raise Exception("Could not read YAML output of tpm2_createek.")
                 if "persistent-handle" in retyaml:
                     handle = retyaml["persistent-handle"]
 
@@ -604,7 +603,7 @@ class tpm(tpm_abstract.AbstractTPM):
                 output = output.replace("0x", " - 0x")
                 output = [output]
 
-            outjson = config.yaml_to_dict(output)
+            outjson = config.yaml_to_dict(output, logger=logger)
             if self.tools_version == "3.2":
                 evict_it = outjson is not None and aik_handle in outjson
             elif self.tools_version in ["4.0", "4.2"]:
@@ -665,7 +664,9 @@ class tpm(tpm_abstract.AbstractTPM):
             if code != tpm_abstract.AbstractTPM.EXIT_SUCESS:
                 raise Exception("tpm2_createak failed with code " + str(code) + ": " + str(reterr))
 
-            jsonout = config.yaml_to_dict(retout)
+            jsonout = config.yaml_to_dict(retout, logger=logger)
+            if jsonout is None:
+                raise Exception("unable to parse YAML output of tpm2_createak. Is your tpm2-tools installation up to date?")
             aik_tpm = retDict['fileouts'][akpubfile.name]
             if aik_tpm == "":
                 raise Exception("unable to read public aik from create identity.  Is your tpm2-tools installation up to date?")
@@ -712,7 +713,10 @@ class tpm(tpm_abstract.AbstractTPM):
             retout = [retout]
 
         owner_pw = self.get_tpm_metadata("owner_pw")
-        jsonout = config.yaml_to_dict(retout)
+        jsonout = config.yaml_to_dict(retout, logger=logger)
+        if jsonout is None:
+            logger.warning("Could not read YAML output of tpm2_getcap.")
+            jsonout = {}
         for key in jsonout:
             if str(hex(key)) != self.defaults['ek_handle']:
                 logger.debug("Flushing key handle %s" % hex(key))
@@ -908,7 +912,9 @@ class tpm(tpm_abstract.AbstractTPM):
         for i, s in enumerate(output):
             output[i] = re.sub(r"[\x01-\x1F\x7F]", "", s.decode('utf-8')).encode('utf-8')
 
-        retyaml = config.yaml_to_dict(output)
+        retyaml = config.yaml_to_dict(output, logger=logger)
+        if retyaml is None:
+            raise Exception("Could not read YAML output of tpm2_getcap.")
         if "TPM2_PT_VENDOR_STRING_1" in retyaml:
             vendorStr = retyaml["TPM2_PT_VENDOR_STRING_1"]["value"]
         elif "TPM_PT_VENDOR_STRING_1" in retyaml:
@@ -943,17 +949,13 @@ class tpm(tpm_abstract.AbstractTPM):
         return self.get_tpm_metadata('ekcert'), self.get_tpm_metadata('ek_tpm'), self.get_tpm_metadata('aik_tpm')
 
     # tpm_quote
-    def __pcr_mask_to_list(self, mask, hash_alg):
+    @staticmethod
+    def __pcr_mask_to_list(mask):
         pcr_list = []
-        ima_appended = ""
         for pcr in range(24):
             if tpm_abstract.TPM_Utilities.check_mask(mask, pcr):
-                if hash_alg != algorithms.Hash.SHA1 and pcr == config.IMA_PCR:
-                    # IMA is only in SHA1 format
-                    ima_appended = "+sha1:" + str(pcr)
-                else:
-                    pcr_list.append(str(pcr))
-        return ",".join(pcr_list) + ima_appended
+                pcr_list.append(str(pcr))
+        return ",".join(pcr_list)
 
     def create_quote(self, nonce, data=None, pcrmask=tpm_abstract.AbstractTPM.EMPTYMASK, hash_alg=None):
         if hash_alg is None:
@@ -974,7 +976,7 @@ class tpm(tpm_abstract.AbstractTPM):
                 # add PCR 16 to pcrmask
                 pcrmask = "0x%X" % (int(pcrmask, 0) + (1 << config.TPM_DATA_PCR))
 
-            pcrlist = self.__pcr_mask_to_list(pcrmask, hash_alg)
+            pcrlist = self.__pcr_mask_to_list(pcrmask)
 
             with self.tpmutilLock:
                 if data is not None:
@@ -1095,7 +1097,7 @@ class tpm(tpm_abstract.AbstractTPM):
         return retout, True
 
     def check_quote(self, agentAttestState, nonce, data, quote, aikTpmFromRegistrar, tpm_policy={},
-                    ima_measurement_list=None, allowlist={}, hash_alg=None, ima_keyring=None,
+                    ima_measurement_list=None, allowlist={}, hash_alg=None, ima_keyrings=None,
                     mb_measurement_list=None, mb_refstate=None) -> Failure:
         failure = Failure(Component.QUOTE_VALIDATION)
         if hash_alg is None:
@@ -1108,39 +1110,38 @@ class tpm(tpm_abstract.AbstractTPM):
             return failure
 
         pcrs = []
-        jsonout = config.yaml_to_dict(retout)
+        jsonout = config.yaml_to_dict(retout, logger=logger)
+        if jsonout is None:
+            failure.add_event("quote_validation", {"message": "YAML parsing failed for quote validation using tpm2-tools.",
+                                                    "data": retout}, False)
+            return failure
         if "pcrs" in jsonout:
             if hash_alg in jsonout["pcrs"]:
-                alg_size = algorithms.get_hash_size(hash_alg) // 4
+                alg_size = hash_alg.get_size() // 4
                 for pcrval, hashval in jsonout["pcrs"][hash_alg].items():
                     pcrs.append("PCR " + str(pcrval) + " " + '{0:0{1}x}'.format(hashval, alg_size))
-            # IMA is always in SHA1 format, so don't leave it behind!
-            if hash_alg != algorithms.Hash.SHA1:
-                if algorithms.Hash.SHA1 in jsonout["pcrs"] and \
-                   config.IMA_PCR in jsonout["pcrs"][algorithms.Hash.SHA1]:
-                    sha1_size = algorithms.get_hash_size(algorithms.Hash.SHA1) // 4
-                    ima_val = jsonout["pcrs"][algorithms.Hash.SHA1][config.IMA_PCR]
-                    pcrs.append("PCR " + str(config.IMA_PCR) + " " + '{0:0{1}x}'.format(ima_val, sha1_size))
 
         if len(pcrs) == 0:
             pcrs = None
 
-        return self.check_pcrs(agentAttestState, tpm_policy, pcrs, data, False, ima_measurement_list, allowlist, ima_keyring, mb_measurement_list, mb_refstate)
+        return self.check_pcrs(agentAttestState, tpm_policy, pcrs, data, False, ima_measurement_list, allowlist,
+                               ima_keyrings, mb_measurement_list, mb_refstate, hash_alg)
 
-    def sim_extend(self, hashval_1, hashval_0=None):
+    def sim_extend(self, hashval_1, hashval_0=None, hash_alg=None):
         # simulate extending a PCR value by performing TPM-specific extend procedure
 
         if hashval_0 is None:
-            hashval_0 = self.START_HASH()
+            hashval_0 = self.START_HASH(hash_alg)
 
         # compute expected value  H(0|H(data))
         extendedval = self.hashdigest(codecs.decode(hashval_0, 'hex_codec') +
-                                      codecs.decode(self.hashdigest(hashval_1.encode('utf-8')), 'hex_codec')).lower()
+                                      codecs.decode(self.hashdigest(hashval_1.encode('utf-8'), hash_alg), 'hex_codec'),
+                                      hash_alg).lower()
         return extendedval
 
     def extendPCR(self, pcrval, hashval, hash_alg=None, lock=True):
         if hash_alg is None:
-            hash_alg = self.defaults['hash']
+            hash_alg = self.defaults['hash'].value
 
         self.__run(["tpm2_pcrextend", "%d:%s=%s" % (pcrval, hash_alg, hashval)], lock=lock)
 
@@ -1152,13 +1153,15 @@ class tpm(tpm_abstract.AbstractTPM):
         elif self.tools_version in ["4.0", "4.2"]:
             output = config.convert(self.__run("tpm2_pcrread")['retout'])
 
-        jsonout = config.yaml_to_dict(output)
+        jsonout = config.yaml_to_dict(output, logger=logger)
+        if jsonout is None:
+            raise Exception("Could not read YAML output of tpm2_pcrread.")
 
         if hash_alg not in jsonout:
             raise Exception("Invalid hashing algorithm '%s' for reading PCR number %d." % (hash_alg, pcrval))
 
         # alg_size = Hash_Algorithms.get_hash_size(hash_alg)/4
-        alg_size = algorithms.get_hash_size(hash_alg) // 4
+        alg_size = hash_alg.get_size() // 4
         return '{0:0{1}x}'.format(jsonout[hash_alg][pcrval], alg_size)
 
     # tpm_random
@@ -1214,7 +1217,7 @@ class tpm(tpm_abstract.AbstractTPM):
                 if self.tools_version in ["4.0", "4.2"]:
                     raise Exception("tpm2_nvreadpublic for ekcert failed with code " + str(code) + ": " + str(reterr))
 
-            outjson = config.yaml_to_dict(output)
+            outjson = config.yaml_to_dict(output, logger=logger)
 
             if outjson is None or 0x1c00002 not in outjson or "size" not in outjson[0x1c00002]:
                 logger.warning("No EK certificate found in TPM NVRAM")
@@ -1321,7 +1324,7 @@ class tpm(tpm_abstract.AbstractTPM):
                 except Exception:
                     pass
 
-    def parse_binary_bootlog(self, log_bin:bytes) -> dict:
+    def parse_binary_bootlog(self, log_bin:bytes) -> typing.Optional[dict]:
         '''Parse and enrich a BIOS boot log
 
         The input is the binary log.
@@ -1331,7 +1334,9 @@ class tpm(tpm_abstract.AbstractTPM):
             log_bin_filename = log_bin_file.name
             retDict_tpm2 = self.__run(['tpm2_eventlog', '--eventlog-version=2', log_bin_filename])
         log_parsed_strs = retDict_tpm2['retout']
-        log_parsed_data = config.yaml_to_dict(log_parsed_strs, add_newlines=False)
+        log_parsed_data = config.yaml_to_dict(log_parsed_strs, add_newlines=False, logger=logger)
+        if log_parsed_data is None:
+            return None
         #pylint: disable=import-outside-toplevel
         try:
             from keylime import tpm_bootlog_enrich
@@ -1352,10 +1357,11 @@ class tpm(tpm_abstract.AbstractTPM):
         log_bin = base64.b64decode(log_b64, validate=True)
         return self.parse_binary_bootlog(log_bin)
 
-    def parse_mb_bootlog(self, mb_measurement_list: str) -> typing.Tuple[dict, typing.Optional[dict], dict, Failure]:
-        """ Parse the measured boot log and return its object and the state of the SHA256 PCRs
+    def parse_mb_bootlog(self, mb_measurement_list: str, hash_alg: algorithms.Hash) -> typing.Tuple[dict, typing.Optional[dict], dict, Failure]:
+        """ Parse the measured boot log and return its object and the state of the PCRs
         :param mb_measurement_list: The measured boot measurement list
-        :returns: Returns a map of the state of the SHA256 PCRs, measured boot data object and True for success
+        :param hash_alg: the hash algorithm that should be used for the PCRs
+        :returns: Returns a map of the state of the PCRs, measured boot data object and True for success
                   and False in case an error occurred
         """
         failure = Failure(Component.MEASURED_BOOT, ["parser"])
@@ -1370,10 +1376,10 @@ class tpm(tpm_abstract.AbstractTPM):
                 logger.error("Parse of measured boot event log has unexpected value for .pcrs: %r", log_pcrs)
                 failure.add_event("invalid_pcrs", {"got": log_pcrs}, True)
                 return {}, None, {}, failure
-            pcrs_sha256 = log_pcrs.get('sha256')
-            if (not isinstance(pcrs_sha256, dict)) or not pcrs_sha256:
-                logger.error("Parse of measured boot event log has unexpected value for .pcrs.sha256: %r", pcrs_sha256)
-                failure.add_event("invalid_pcrs_sha256", {"got": pcrs_sha256}, True)
+            pcr_hashes = log_pcrs.get(str(hash_alg))
+            if (not isinstance(pcr_hashes, dict)) or not pcr_hashes:
+                logger.error("Parse of measured boot event log has unexpected value for .pcrs.%s: %r", str(hash_alg), pcr_hashes)
+                failure.add_event("invalid_pcrs_hashes", {"got": pcr_hashes}, True)
                 return {}, None, {}, failure
             boot_aggregates = mb_measurement_data.get('boot_aggregates')
             if (not isinstance(boot_aggregates, dict)) or not boot_aggregates:
@@ -1381,6 +1387,6 @@ class tpm(tpm_abstract.AbstractTPM):
                 failure.add_event("invalid_boot_aggregates", {"got": boot_aggregates}, True)
                 return {}, None, {}, failure
 
-            return pcrs_sha256, boot_aggregates, mb_measurement_data, failure
+            return pcr_hashes, boot_aggregates, mb_measurement_data, failure
 
         return {}, None, {}, failure

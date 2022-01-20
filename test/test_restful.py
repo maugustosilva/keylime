@@ -41,18 +41,19 @@ import errno
 from pathlib import Path
 
 import dbus
-import simplejson as json
 
 from keylime import config
 from keylime import tornado_requests
 from keylime.requests_client import RequestsClient
 from keylime import tenant
 from keylime import crypto
+from keylime import json
 from keylime.cmd import user_data_encrypt
 from keylime import secure_mount
 from keylime.tpm import tpm_main
 from keylime.tpm import tpm_abstract
 from keylime import api_version
+from keylime.common import algorithms
 
 
 # Coverage support
@@ -238,8 +239,8 @@ def launch_registrar():
                 line = reg_process.stdout.readline()
                 if line == b"":
                     break
-                # line = line.rstrip(os.linesep)
                 line = line.decode('utf-8')
+                line = line.rstrip(os.linesep)
                 sys.stdout.flush()
                 sys.stdout.write('\n\033[95m' + line + '\033[0m')
         t = threading.Thread(target=initthread)
@@ -265,8 +266,8 @@ def launch_cloudagent():
                 line = agent_process.stdout.readline()
                 if line == b'':
                     break
-                # line = line.rstrip(os.linesep)
                 line = line.decode('utf-8')
+                line = line.rstrip(os.linesep)
                 sys.stdout.flush()
                 sys.stdout.write('\n\033[94m' + line + '\033[0m')
         t = threading.Thread(target=initthread)
@@ -562,7 +563,7 @@ class TestRestful(unittest.TestCase):
                                         json_response["results"]["pubkey"],
                                         json_response["results"]["quote"],
                                         aik_tpm,
-                                        hash_alg=json_response["results"]["hash_alg"])
+                                        hash_alg=algorithms.Hash(json_response["results"]["hash_alg"]))
         self.assertTrue(not failure, "Invalid quote!")
 
     @unittest.skip("Testing of agent's POST /keys/vkey disabled!  (spawned CV should do this already)")
@@ -844,7 +845,7 @@ class TestRestful(unittest.TestCase):
         self.assertIn("hash_alg", json_response["results"], "Malformed response body!")
 
         quote = json_response["results"]["quote"]
-        hash_alg = json_response["results"]["hash_alg"]
+        hash_alg = algorithms.Hash(json_response["results"]["hash_alg"])
 
         failure = tpm_instance.check_quote(tenant_templ.agent_uuid,
                                      nonce,

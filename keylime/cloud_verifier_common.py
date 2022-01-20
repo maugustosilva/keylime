@@ -5,19 +5,13 @@ Copyright 2017 Massachusetts Institute of Technology.
 
 import ast
 import base64
-import os
-import ssl
-import socket
 import time
-import sys
-
-import simplejson as json
 
 from keylime import config
 from keylime import keylime_logging
 from keylime import registrar_client
 from keylime import crypto
-from keylime import ca_util
+from keylime import json
 from keylime import revocation_notifier
 from keylime.agentstates import AgentAttestStates
 from keylime.failure import Failure, Component
@@ -42,100 +36,6 @@ def get_tpm_instance():
 
 def get_AgentAttestStates():
     return AgentAttestStates.get_instance()
-
-
-def init_mtls(section='cloud_verifier', generatedir='cv_ca'):
-    if not config.getboolean('general', "enable_tls"):
-        logger.warning(
-            "Warning: TLS is currently disabled, keys will be sent in the clear! This should only be used for testing.")
-        return None
-
-    logger.info("Setting up TLS...")
-    my_cert = config.get(section, 'my_cert')
-    ca_cert = config.get(section, 'ca_cert')
-    my_priv_key = config.get(section, 'private_key')
-    my_key_pw = config.get(section, 'private_key_pw')
-    tls_dir = config.get(section, 'tls_dir')
-
-    if tls_dir == 'generate':
-        if my_cert != 'default' or my_priv_key != 'default' or ca_cert != 'default':
-            raise Exception(
-                "To use tls_dir=generate, options ca_cert, my_cert, and private_key must all be set to 'default'")
-
-        if generatedir[0] != '/':
-            generatedir = os.path.abspath(os.path.join(config.WORK_DIR,
-                                                       generatedir))
-        tls_dir = generatedir
-        ca_path = "%s/cacert.crt" % (tls_dir)
-        if os.path.exists(ca_path):
-            logger.info("Existing CA certificate found in %s, not generating a new one", tls_dir)
-        else:
-            logger.info("Generating a new CA in %s and a client certificate for connecting", tls_dir)
-            logger.info("use keylime_ca -d %s to manage this CA", tls_dir)
-            if not os.path.exists(tls_dir):
-                os.makedirs(tls_dir, 0o700)
-            if my_key_pw == 'default':
-                logger.warning("CAUTION: using default password for CA, please set private_key_pw to a strong password")
-            ca_util.setpassword(my_key_pw)
-            ca_util.cmd_init(tls_dir)
-            ca_util.cmd_mkcert(tls_dir, socket.gethostname())
-            ca_util.cmd_mkcert(tls_dir, 'client')
-
-    if tls_dir == 'CV':
-        if section != 'registrar':
-            raise Exception(
-                "You only use the CV option to tls_dir for the registrar not %s" % section)
-        tls_dir = os.path.abspath(os.path.join(config.WORK_DIR, 'cv_ca'))
-        if not os.path.exists("%s/cacert.crt" % (tls_dir)):
-            raise Exception(
-                "It appears that the verifier has not yet created a CA and certificates, please run the verifier first")
-
-    # if it is relative path, convert to absolute in WORK_DIR
-    if tls_dir[0] != '/':
-        tls_dir = os.path.abspath(os.path.join(config.WORK_DIR, tls_dir))
-
-    if ca_cert == 'default':
-        ca_path = os.path.join(tls_dir, "cacert.crt")
-    elif not os.path.isabs(ca_cert):
-        ca_path = os.path.join(tls_dir, ca_cert)
-    else:
-        ca_path = ca_cert
-
-    if my_cert == 'default':
-        my_cert = os.path.join(tls_dir, f"{socket.gethostname()}-cert.crt")
-    elif not os.path.isabs(my_cert):
-        my_cert = os.path.join(tls_dir, my_cert)
-    else:
-        pass
-
-    if my_priv_key == 'default':
-        my_priv_key = os.path.join(tls_dir,
-                                   f"{socket.gethostname()}-private.pem")
-    elif not os.path.isabs(my_priv_key):
-        my_priv_key = os.path.join(tls_dir, my_priv_key)
-
-    try:
-        context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
-        if sys.version_info >= (3,7):
-            context.minimum_version = ssl.TLSVersion.TLSv1_2
-        else:
-            context.options &= ~ssl.OP_NO_TLSv1_2
-        context.load_verify_locations(cafile=ca_path)
-        context.load_cert_chain(
-            certfile=my_cert, keyfile=my_priv_key, password=my_key_pw)
-        if (config.has_option(section, 'check_client_cert')
-                and config.getboolean(section, 'check_client_cert')):
-            context.verify_mode = ssl.CERT_REQUIRED
-    except ssl.SSLError as exc:
-        if exc.reason == 'EE_KEY_TOO_SMALL':
-            logger.error('Higher key strength is required for keylime '
-                         'running on this system. If keylime is responsible '
-                         'to generate the certificate, please raise the value '
-                         'of configuration option [ca]cert_bits, remove '
-                         'generated certificate and re-run keylime service')
-        raise exc
-
-    return context
 
 
 def process_quote_response(agent, json_response, agentAttestState) -> Failure:
@@ -203,7 +103,8 @@ def process_quote_response(agent, json_response, agentAttestState) -> Failure:
     agent['sign_alg'] = sign_alg
 
     # Ensure hash_alg is in accept_tpm_hash_alg list
-    if not algorithms.is_accepted(hash_alg, agent['accept_tpm_hash_algs']):
+    if not algorithms.is_accepted(hash_alg, agent['accept_tpm_hash_algs'])\
+            or not algorithms.Hash.is_recognized(hash_alg):
         logger.error(f"TPM Quote is using an unaccepted hash algorithm: {hash_alg}")
         failure.add_event("invalid_hash_alg",
                           {"message": f"TPM Quote is using an unaccepted hash algorithm: {hash_alg}", "data": hash_alg},
@@ -246,7 +147,10 @@ def process_quote_response(agent, json_response, agentAttestState) -> Failure:
 
     agentAttestState.set_boottime(boottime)
 
-    ima_keyring = ima_file_signatures.ImaKeyring.from_string(agent['ima_sign_verification_keys'])
+    ima_keyrings = agentAttestState.get_ima_keyrings()
+    tenant_keyring = ima_file_signatures.ImaKeyring.from_string(agent['ima_sign_verification_keys'])
+    ima_keyrings.set_tenant_keyring(tenant_keyring)
+
     quote_validation_failure = get_tpm_instance().check_quote(
         agentAttestState,
         agent['nonce'],
@@ -256,8 +160,8 @@ def process_quote_response(agent, json_response, agentAttestState) -> Failure:
         agent['tpm_policy'],
         ima_measurement_list,
         agent['allowlist'],
-        hash_alg,
-        ima_keyring,
+        algorithms.Hash(hash_alg),
+        ima_keyrings,
         mb_measurement_list,
         agent['mb_refstate'])
     failure.merge(quote_validation_failure)
@@ -366,7 +270,7 @@ def process_get_status(agent):
 
 def notify_error(agent, msgtype='revocation', event=None):
     send_mq = config.getboolean('cloud_verifier', 'revocation_notifier')
-    send_webhook = config.getboolean('cloud_verifier', 'revocation_notifier_webhook', False)
+    send_webhook = config.getboolean('cloud_verifier', 'revocation_notifier_webhook', fallback=False)
     if not (send_mq or send_webhook):
         return
 

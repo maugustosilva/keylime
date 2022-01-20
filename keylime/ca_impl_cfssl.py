@@ -12,13 +12,13 @@ import shutil
 import sys
 
 import requests
-import simplejson as json
 
 from cryptography import x509
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import serialization
 
 from keylime import config
+from keylime import json
 from keylime import keylime_logging
 from keylime import secure_mount
 
@@ -127,6 +127,7 @@ def mk_cacert(name=None):
         privkey = serialization.load_pem_private_key(
             body['result']['private_key'].encode('utf-8'),
             password=None,
+            backend=default_backend(),
         )
         cert = x509.load_pem_x509_certificate(
             data=body['result']['certificate'].encode('utf-8'),
@@ -212,6 +213,7 @@ def mk_signed_cert(cacert, ca_pk, name, serialnum):
         pk = serialization.load_pem_private_key(
             body['result']['private_key'].encode('utf-8'),
             password=None,
+            backend=default_backend(),
         )
         cert = x509.load_pem_x509_certificate(
             data=body['result']['certificate'].encode('utf-8'),

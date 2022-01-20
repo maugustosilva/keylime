@@ -6,6 +6,7 @@ Copyright 2017 Massachusetts Institute of Technology.
 import datetime
 
 from cryptography import x509
+from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
@@ -24,7 +25,7 @@ def mk_cert_valid(cert_req, days=365):
     """
 
     one_day = datetime.timedelta(1, 0, 0)
-    today = datetime.datetime.today()
+    today = datetime.datetime.now(datetime.timezone.utc)
     cert_req = cert_req.not_valid_before(today)
     cert_req = cert_req.not_valid_after(today + (one_day * days))
     return cert_req
@@ -63,6 +64,7 @@ def mk_request(bits, common_name):
     privkey = rsa.generate_private_key(
         public_exponent=65537,
         key_size=bits,
+        backend=default_backend(),
     )
 
     cert_req = x509.CertificateBuilder()
@@ -128,6 +130,7 @@ def mk_cacert(name=None):
     cert = cert_req.sign(
         private_key=privkey,
         algorithm=hashes.SHA256(),
+        backend=default_backend(),
     )
 
     return cert, privkey, pubkey
@@ -177,6 +180,7 @@ def mk_signed_cert(cacert, ca_privkey, name, serialnum):
     cert = cert_req.sign(
         private_key=ca_privkey,
         algorithm=hashes.SHA256(),
+        backend=default_backend(),
     )
     return cert, privkey
 

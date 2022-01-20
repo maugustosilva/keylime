@@ -9,14 +9,13 @@ import functools
 import time
 import os
 import sys
-import signal
 
 import requests
-import simplejson as json
 import zmq
 
 from keylime import config
 from keylime import crypto
+from keylime import json
 from keylime import keylime_logging
 from keylime import secure_mount
 
@@ -39,8 +38,10 @@ def start_broker():
             f"tcp://{config.get('cloud_verifier', 'revocation_notifier_ip')}:"
             f"{config.getint('cloud_verifier', 'revocation_notifier_port')}"
         )
-
-        zmq.device(zmq.FORWARDER, frontend, backend)
+        try:
+            zmq.device(zmq.FORWARDER, frontend, backend)
+        except (KeyboardInterrupt, SystemExit):
+            context.destroy()
 
     global broker_proc
     broker_proc = Process(target=worker)
@@ -53,7 +54,9 @@ def stop_broker():
         # Remove the socket file before  we kill the process
         if os.path.exists("/tmp/keylime.verifier.ipc"):
             os.remove("/tmp/keylime.verifier.ipc")
-        os.kill(broker_proc.pid, signal.SIGKILL)
+        logger.info("Stopping revocation notifier...")
+        broker_proc.terminate()
+        broker_proc.join()
 
 
 def notify(tosend):
@@ -81,7 +84,7 @@ def notify(tosend):
 
 
 def notify_webhook(tosend):
-    url = config.get('cloud_verifier', 'webhook_url', '')
+    url = config.get('cloud_verifier', 'webhook_url', fallback='')
     # Check if a url was specified
     if url == '':
         return

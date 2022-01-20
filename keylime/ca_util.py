@@ -39,8 +39,6 @@ try:
 except ImportError:
     from yaml import SafeLoader, SafeDumper
 
-import simplejson as json
-
 from cryptography import exceptions as crypto_exceptions
 from cryptography import x509
 from cryptography.hazmat.backends import default_backend
@@ -50,6 +48,7 @@ from cryptography.hazmat.primitives.asymmetric import padding
 from keylime import cmd_exec
 from keylime import config
 from keylime import crypto
+from keylime import json
 from keylime import revocation_notifier
 from keylime import keylime_logging
 
@@ -89,7 +88,11 @@ def cmd_mkcert(workingdir, name):
         config.ch_dir(workingdir, logger)
         priv = read_private()
         cacert = load_cert_by_path('cacert.crt')
-        ca_pk = serialization.load_pem_private_key(priv[0]['ca'], password=None)
+        ca_pk = serialization.load_pem_private_key(
+            priv[0]['ca'],
+            password=None,
+            backend=default_backend()
+        )
 
         cert, pk = ca_impl.mk_signed_cert(
             cacert, ca_pk, name, priv[0]['lastserial'] + 1)

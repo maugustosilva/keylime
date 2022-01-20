@@ -7,6 +7,9 @@ Copyright 2017 Massachusetts Institute of Technology.
 
 import asyncio
 import http.server
+import multiprocessing
+import platform
+import signal
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 import threading
@@ -25,8 +28,6 @@ import shutil
 import subprocess
 import psutil
 
-import simplejson as json
-
 from cryptography.hazmat.primitives import serialization
 
 from keylime import config
@@ -34,11 +35,13 @@ from keylime import keylime_logging
 from keylime import cmd_exec
 from keylime import crypto
 from keylime import ima
-from keylime import openstack
+from keylime import json
 from keylime import revocation_notifier
 from keylime import registrar_client
 from keylime import secure_mount
+from keylime import web_util
 from keylime import api_version as keylime_api_version
+from keylime.common import algorithms
 from keylime.tpm.tpm_main import tpm
 from keylime.tpm.tpm_abstract import TPM_Utilities
 from keylime.tpm.tpm2_objects import pubkey_from_tpm2b_public
@@ -58,7 +61,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_HEAD(self):
         """Not supported"""
-        config.echo_json_response(self, 405, "HEAD not supported")
+        web_util.echo_json_response(self, 405, "HEAD not supported")
 
     def do_GET(self):
         """This method services the GET request typically from either the Tenant or the Cloud Verifier.
@@ -68,26 +71,32 @@ class Handler(BaseHTTPRequestHandler):
         """
 
         logger.info('GET invoked from %s with uri: %s', self.client_address, self.path)
-        rest_params = config.get_restful_params(self.path)
+        rest_params = web_util.get_restful_params(self.path)
         if rest_params is None:
-            config.echo_json_response(
+            web_util.echo_json_response(
                 self, 405, "Not Implemented: Use /keys/ or /quotes/ interfaces")
             return
 
         if not rest_params["api_version"]:
-            config.echo_json_response(self, 400, "API Version not supported")
+            web_util.echo_json_response(self, 400, "API Version not supported")
             return
 
         if "keys" in rest_params and rest_params['keys'] == 'verify':
             if self.server.K is None:
                 logger.info('GET key challenge returning 400 response. bootstrap key not available')
-                config.echo_json_response(
+                web_util.echo_json_response(
                     self, 400, "Bootstrap key not yet available.")
                 return
+            if "challenge" not in rest_params:
+                logger.info('GET key challenge returning 400 response. No challenge provided')
+                web_util.echo_json_response(
+                    self, 400, "No challenge provided.")
+                return
+
             challenge = rest_params['challenge']
             response = {}
             response['hmac'] = crypto.do_hmac(self.server.K, challenge)
-            config.echo_json_response(self, 200, "Success", response)
+            web_util.echo_json_response(self, 200, "Success", response)
             logger.info('GET key challenge returning 200 response.')
 
         # If agent pubkey requested
@@ -95,31 +104,36 @@ class Handler(BaseHTTPRequestHandler):
             response = {}
             response['pubkey'] = self.server.rsapublickey_exportable
 
-            config.echo_json_response(self, 200, "Success", response)
+            web_util.echo_json_response(self, 200, "Success", response)
             logger.info('GET pubkey returning 200 response.')
             return
 
         elif "quotes" in rest_params:
-            nonce = rest_params['nonce']
+            nonce = rest_params.get('nonce', None)
             pcrmask = rest_params.get('mask', None)
-            vpcrmask = rest_params.get('vmask', None)
             ima_ml_entry = rest_params.get('ima_ml_entry', '0')
 
             # if the query is not messed up
             if nonce is None:
                 logger.warning('GET quote returning 400 response. nonce not provided as an HTTP parameter in request')
-                config.echo_json_response(
+                web_util.echo_json_response(
                     self, 400, "nonce not provided as an HTTP parameter in request")
                 return
 
             # Sanitization assurance (for tpm.run() tasks below)
             if not (nonce.isalnum() and
-                    (pcrmask is None or pcrmask.isalnum()) and
-                    (vpcrmask is None or vpcrmask.isalnum() and
-                    ima_ml_entry.isalnum())):
+                    (pcrmask is None or config.valid_hex(pcrmask)) and
+                    ima_ml_entry.isalnum()):
                 logger.warning('GET quote returning 400 response. parameters should be strictly alphanumeric')
-                config.echo_json_response(
+                web_util.echo_json_response(
                     self, 400, "parameters should be strictly alphanumeric")
+                return
+
+            if len(nonce) > tpm_instance.MAX_NONCE_SIZE:
+                logger.warning('GET quote returning 400 response. Nonce is too long (max size %i): %i',
+                               tpm_instance.MAX_NONCE_SIZE, len(nonce))
+                web_util.echo_json_response(
+                    self, 400, f'Nonce is too long (max size {tpm_instance.MAX_NONCE_SIZE}): {len(nonce)}')
                 return
 
             # identity quotes are always shallow
@@ -133,7 +147,7 @@ class Handler(BaseHTTPRequestHandler):
             enc_alg = tpm_instance.defaults['encrypt']
             sign_alg = tpm_instance.defaults['sign']
 
-            if "partial" in rest_params and (rest_params["partial"] is None or int(rest_params["partial"], 0) == 1):
+            if "partial" in rest_params and (rest_params["partial"] is None or rest_params["partial"] == "1"):
                 response = {
                     'quote': quote,
                     'hash_alg': hash_alg,
@@ -174,13 +188,13 @@ class Handler(BaseHTTPRequestHandler):
                         el = base64.b64encode(f.read())
                     response['mb_measurement_list'] = el
 
-            config.echo_json_response(self, 200, "Success", response)
+            web_util.echo_json_response(self, 200, "Success", response)
             logger.info('GET %s quote returning 200 response.', rest_params["quotes"])
             return
 
         else:
             logger.warning('GET returning 400 response. uri not supported: %s', self.path)
-            config.echo_json_response(self, 400, "uri not supported")
+            web_util.echo_json_response(self, 400, "uri not supported")
             return
 
     def do_POST(self):
@@ -189,33 +203,45 @@ class Handler(BaseHTTPRequestHandler):
         Only tenant and cloudverifier uri's are supported. Both requests require a nonce parameter.
         The Cloud verifier requires an additional mask parameter.  If the uri or parameters are incorrect, a 400 response is returned.
         """
-        rest_params = config.get_restful_params(self.path)
+        rest_params = web_util.get_restful_params(self.path)
 
         if rest_params is None:
-            config.echo_json_response(
+            web_util.echo_json_response(
                 self, 405, "Not Implemented: Use /keys/ interface")
             return
 
         if not rest_params["api_version"]:
-            config.echo_json_response(self, 400, "API Version not supported")
+            web_util.echo_json_response(self, 400, "API Version not supported")
+            return
+
+        if rest_params.get("keys", None) not in ["ukey", "vkey"]:
+            web_util.echo_json_response(self, 400, "Only /keys/ukey or /keys/vkey are supported")
             return
 
         content_length = int(self.headers.get('Content-Length', 0))
         if content_length <= 0:
             logger.warning('POST returning 400 response, expected content in message. url: %s', self.path)
-            config.echo_json_response(self, 400, "expected content in message")
+            web_util.echo_json_response(self, 400, "expected content in message")
             return
 
         post_body = self.rfile.read(content_length)
-        json_body = json.loads(post_body)
-
-        b64_encrypted_key = json_body['encrypted_key']
-        decrypted_key = crypto.rsa_decrypt(
-            self.server.rsaprivatekey, base64.b64decode(b64_encrypted_key))
+        try:
+            json_body = json.loads(post_body)
+            b64_encrypted_key = json_body['encrypted_key']
+            decrypted_key = crypto.rsa_decrypt(
+                self.server.rsaprivatekey, base64.b64decode(b64_encrypted_key))
+        except (ValueError, KeyError, TypeError) as e:
+            logger.warning('POST returning 400 response, could not parse body data: %s', e)
+            web_util.echo_json_response(self, 400, "content is invalid")
+            return
 
         have_derived_key = False
 
         if rest_params["keys"] == "ukey":
+            if 'auth_tag' not in json_body:
+                logger.warning('POST returning 400 response, U key provided without an auth_tag')
+                web_util.echo_json_response(self, 400, "auth_tag is missing")
+                return
             self.server.add_U(decrypted_key)
             self.server.auth_tag = json_body['auth_tag']
             self.server.payload = json_body.get('payload', None)
@@ -225,10 +251,10 @@ class Handler(BaseHTTPRequestHandler):
             have_derived_key = self.server.attempt_decryption()
         else:
             logger.warning('POST returning  response. uri not supported: %s', self.path)
-            config.echo_json_response(self, 400, "uri not supported")
+            web_util.echo_json_response(self, 400, "uri not supported")
             return
         logger.info('POST of %s key returning 200', ('V', 'U')[rest_params["keys"] == "ukey"])
-        config.echo_json_response(self, 200, "Success")
+        web_util.echo_json_response(self, 200, "Success")
 
         # no key yet, then we're done
         if not have_derived_key:
@@ -301,12 +327,8 @@ class Handler(BaseHTTPRequestHandler):
                         env['AGENT_UUID'] = self.server.agent_uuid
                         proc = subprocess.Popen(["/bin/bash", initscript], env=env, shell=False, cwd='%s/unzipped' % secdir,
                                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-                        while True:
-                            line = proc.stdout.readline()
-                            if line == '' and proc.poll() is not None:
-                                break
-                            if line:
-                                logger.debug("init-output: %s", line.strip())
+                        for line in iter(proc.stdout.readline, b''):
+                            logger.debug("init-output: %s", line.strip())
                         # should be a no-op as poll already told us it's done
                         proc.wait()
 
@@ -315,7 +337,7 @@ class Handler(BaseHTTPRequestHandler):
                         logger.info("No payload script %s found in %s/unzipped", initscript, secdir)
                     else:
                         logger.info("Executing payload script: %s/unzipped/%s", secdir, initscript)
-                        payload_thread = threading.Thread(target=initthread)
+                        payload_thread = threading.Thread(target=initthread, daemon=True)
             else:
                 logger.info("Decrypting payload to %s", dec_path)
                 with open(dec_path, 'wb') as f:
@@ -475,9 +497,77 @@ class CloudAgentHTTPServer(ThreadingMixIn, HTTPServer):
         return False
 
 
+def revocation_listener():
+    """
+    This configures and starts the revocation listener. It is designed to be started in a separate process.
+    """
+
+    if not config.getboolean('cloud_agent', 'listen_notfications'):
+        return
+
+    secdir = secure_mount.mount()
+
+    cert_path = config.get('cloud_agent', 'revocation_cert')
+    if cert_path == "default":
+        cert_path = os.path.join(secdir,
+                                 "unzipped/RevocationNotifier-cert.crt")
+    elif cert_path[0] != '/':
+        # if it is a relative, convert to absolute in work_dir
+        cert_path = os.path.abspath(
+            os.path.join(config.WORK_DIR, cert_path))
+
+    # Callback function handling the revocations
+    def perform_actions(revocation):
+        actionlist = []
+
+        # load the actions from inside the keylime module
+        actionlisttxt = config.get('cloud_agent', 'revocation_actions')
+        if actionlisttxt.strip() != "":
+            actionlist = actionlisttxt.split(',')
+            actionlist = ["revocation_actions.%s" % i for i in actionlist]
+
+        # load actions from unzipped
+        action_list_path = os.path.join(secdir, "unzipped/action_list")
+        if os.path.exists(action_list_path):
+            with open(action_list_path, encoding="utf-8") as f:
+                actionlisttxt = f.read()
+            if actionlisttxt.strip() != "":
+                localactions = actionlisttxt.strip().split(',')
+                for action in localactions:
+                    if not action.startswith('local_action_'):
+                        logger.warning("Invalid local action: %s. Must start with local_action_", action)
+                    else:
+                        actionlist.append(action)
+
+                uzpath = "%s/unzipped" % secdir
+                if uzpath not in sys.path:
+                    sys.path.append(uzpath)
+
+        for action in actionlist:
+            logger.info("Executing revocation action %s", action)
+            try:
+                module = importlib.import_module(action)
+                execute = getattr(module, 'execute')
+                asyncio.get_event_loop().run_until_complete(execute(revocation))
+            except Exception as e:
+                logger.warning("Exception during execution of revocation action %s: %s", action, e)
+
+    try:
+        while True:
+            try:
+                revocation_notifier.await_notifications(
+                    perform_actions, revocation_cert_path=cert_path)
+            except Exception as e:
+                logger.exception(e)
+                logger.warning("No connection to revocation server, retrying in 10s...")
+                time.sleep(10)
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Stopping revocation listener...")
+
+
 def main():
-    for ML in [ config.MEASUREDBOOT_ML, config.IMA_ML ] :
-        if not os.access(ML, os.F_OK) :
+    for ML in [config.MEASUREDBOOT_ML, config.IMA_ML]:
+        if not os.access(ML, os.F_OK):
             logger.warning("Measurement list path %s not accessible by agent. Any attempt to instruct it to access this path - via \"keylime_tenant\" CLI - will result in agent process dying", ML)
 
     if config.get('cloud_agent', 'agent_uuid') == 'dmidecode':
@@ -506,7 +596,7 @@ def main():
         contact_port = config.get('cloud_agent', 'agent_contact_port', fallback="invalid")
 
     # initialize the tmpfs partition to store keys if it isn't already available
-    secdir = secure_mount.mount()
+    secure_mount.mount()
 
     # change dir to working dir
     config.ch_dir(config.WORK_DIR, logger)
@@ -515,6 +605,13 @@ def main():
     (ekcert, ek_tpm, aik_tpm) = instance_tpm.tpm_init(self_activate=False, config_pw=config.get(
         'cloud_agent', 'tpm_ownerpassword'))  # this tells initialize not to self activate the AIK
     virtual_agent = instance_tpm.is_vtpm()
+
+    # Warn if kernel version is <5.10 and another algorithm than SHA1 is used,
+    # because otherwise IMA will not work
+    kernel_version = tuple(platform.release().split("-")[0].split("."))
+    if kernel_version < ("5", "10", "0") and instance_tpm.defaults["hash"] != algorithms.Hash.SHA1:
+        logger.warning("IMA attestation only works on kernel versions <5.10 with SHA1 as tpm_hash_alg. "
+                       "Current algorithm is: %s", instance_tpm.defaults["hash"])
 
     if ekcert is None:
         if virtual_agent:
@@ -527,9 +624,7 @@ def main():
         agent_uuid = config.get('cloud_agent', 'agent_uuid')
     except configparser.NoOptionError:
         agent_uuid = None
-    if agent_uuid == 'openstack':
-        agent_uuid = openstack.get_openstack_uuid()
-    elif agent_uuid == 'hash_ek':
+    if agent_uuid == 'hash_ek':
         ek_pubkey = pubkey_from_tpm2b_public(base64.b64decode(ek_tpm))
         ek_pubkey_pem = ek_pubkey.public_bytes(encoding=serialization.Encoding.PEM,
                                                format=serialization.PublicFormat.SubjectPublicKeyInfo)
@@ -547,6 +642,11 @@ def main():
             raise RuntimeError("The UUID returned from dmidecode is invalid: %s" % e)  # pylint: disable=raise-missing-from
     elif agent_uuid == 'hostname':
         agent_uuid = socket.getfqdn()
+    elif agent_uuid == 'environment':
+        agent_uuid = os.getenv("KEYLIME_AGENT_UUID", None)
+        if agent_uuid is None:
+            raise RuntimeError("Env variable KEYLIME_AGENT_UUID is empty, but agent_uuid is set to 'environment'")
+
     if config.STUB_VTPM and config.TPM_CANNED_VALUES is not None:
         # Use canned values for stubbing
         jsonIn = config.TPM_CANNED_VALUES
@@ -576,7 +676,6 @@ def main():
         raise Exception("Activation failed")
 
     # tell the registrar server we know the key
-    retval = False
     retval = registrar_client.doActivateAgent(
         registrar_ip, registrar_port, agent_uuid, key)
 
@@ -587,74 +686,33 @@ def main():
     serveraddr = (config.get('cloud_agent', 'cloudagent_ip'),
                   config.getint('cloud_agent', 'cloudagent_port'))
     server = CloudAgentHTTPServer(serveraddr, Handler, agent_uuid)
-    serverthread = threading.Thread(target=server.serve_forever)
+    serverthread = threading.Thread(target=server.serve_forever, daemon=True)
+
+    # Start revocation listener in a new process to not interfere with tornado
+    revocation_process = multiprocessing.Process(target=revocation_listener, daemon=True)
+    revocation_process.start()
 
     logger.info("Starting Cloud Agent on %s:%s with API version %s. Use <Ctrl-C> to stop", serveraddr[0], serveraddr[1], keylime_api_version.current_version())
     serverthread.start()
 
-    # want to listen for revocations?
-    if config.getboolean('cloud_agent', 'listen_notfications'):
-        cert_path = config.get('cloud_agent', 'revocation_cert')
-        if cert_path == "default":
-            cert_path = os.path.join(secdir,
-                                      "unzipped/RevocationNotifier-cert.crt")
-        elif cert_path[0] != '/':
-            # if it is a relative, convert to absolute in work_dir
-            cert_path = os.path.abspath(
-                os.path.join(config.WORK_DIR, cert_path))
+    def shutdown_handler(*_):
+        logger.info("TERM Signal received, shutting down...")
+        logger.debug("Stopping revocation notifier...")
+        revocation_process.terminate()
+        logger.debug("Shutting down HTTP server...")
+        server.shutdown()
+        server.server_close()
+        serverthread.join()
+        logger.debug("...HTTP server stopped")
+        revocation_process.join()
+        logger.debug("... revocation notifier stopped")
+        instance_tpm.flush_keys()
+        logger.debug("Flushed keys successfully")
+        sys.exit(0)
 
-        def perform_actions(revocation):
-            actionlist = []
+    signal.signal(signal.SIGTERM, shutdown_handler)
+    signal.signal(signal.SIGQUIT, shutdown_handler)
+    signal.signal(signal.SIGINT, shutdown_handler)
 
-            # load the actions from inside the keylime module
-            actionlisttxt = config.get('cloud_agent', 'revocation_actions')
-            if actionlisttxt.strip() != "":
-                actionlist = actionlisttxt.split(',')
-                actionlist = ["revocation_actions.%s" % i for i in actionlist]
-
-            # load actions from unzipped
-            action_list_path = os.path.join(secdir, "unzipped/action_list")
-            if os.path.exists(action_list_path):
-                with open(action_list_path, encoding="utf-8") as f:
-                    actionlisttxt = f.read()
-                if actionlisttxt.strip() != "":
-                    localactions = actionlisttxt.strip().split(',')
-                    for action in localactions:
-                        if not action.startswith('local_action_'):
-                            logger.warning("Invalid local action: %s. Must start with local_action_", action)
-                        else:
-                            actionlist.append(action)
-
-                    uzpath = "%s/unzipped" % secdir
-                    if uzpath not in sys.path:
-                        sys.path.append(uzpath)
-
-            for action in actionlist:
-                logger.info("Executing revocation action %s", action)
-                try:
-                    module = importlib.import_module(action)
-                    execute = getattr(module, 'execute')
-                    asyncio.get_event_loop().run_until_complete(execute(revocation))
-                except Exception as e:
-                    logger.warning("Exception during execution of revocation action %s: %s", action, e)
-        try:
-            while True:
-                try:
-                    revocation_notifier.await_notifications(
-                        perform_actions, revocation_cert_path=cert_path)
-                except Exception as e:
-                    logger.exception(e)
-                    logger.warning("No connection to revocation server, retrying in 10s...")
-                    time.sleep(10)
-        except KeyboardInterrupt:
-            logger.info("TERM Signal received, shutting down...")
-            instance_tpm.flush_keys()
-            server.shutdown()
-    else:
-        try:
-            while True:
-                time.sleep(1)
-        except KeyboardInterrupt:
-            logger.info("TERM Signal received, shutting down...")
-            instance_tpm.flush_keys()
-            server.shutdown()
+    # Keep the main thread alive by waiting for the server thread
+    serverthread.join()

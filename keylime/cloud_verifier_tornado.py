@@ -3,19 +3,19 @@
 SPDX-License-Identifier: Apache-2.0
 Copyright 2017 Massachusetts Institute of Technology.
 '''
-
+import signal
 import traceback
 import sys
 import functools
 import asyncio
 
-import simplejson as json
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm.exc import NoResultFound
 import tornado.ioloop
 import tornado.web
 
 from keylime import config
+from keylime import json
 from keylime.agentstates import AgentAttestStates
 from keylime.common import states
 from keylime.db.verifier_db import VerfierMain
@@ -24,9 +24,9 @@ from keylime.db.keylime_db import DBEngineManager, SessionManager
 from keylime import keylime_logging
 from keylime import cloud_verifier_common
 from keylime import revocation_notifier
+from keylime import web_util
 from keylime import tornado_requests
 from keylime import api_version as keylime_api_version
-from keylime.ima_ast import START_HASH
 from keylime.failure import MAX_SEVERITY_LABEL, Failure, Component
 
 logger = keylime_logging.init_logging('cloudverifier')
@@ -61,7 +61,8 @@ exclude_db = {
     'boottime': '',
     'ima_pcrs': [],
     'pcr10': '',
-    'next_ima_ml_entry': 0
+    'next_ima_ml_entry': 0,
+    'learned_ima_keyrings': {},
 }
 
 
@@ -88,7 +89,8 @@ def _from_db_obj(agent_db_obj):
                 'boottime', \
                 'ima_pcrs', \
                 'pcr10', \
-                'next_ima_ml_entry']
+                'next_ima_ml_entry', \
+                'learned_ima_keyrings' ]
     agent_dict = {}
     for field in fields:
         agent_dict[field] = getattr(agent_db_obj, field, None)
@@ -104,7 +106,7 @@ def verifier_db_delete_agent(session, agent_id):
 
 def store_attestation_state(agentAttestState):
     # Only store if IMA log was evaluated
-    if len(agentAttestState.get_ima_pcrs()):
+    if agentAttestState.get_ima_pcrs():
         session = get_session()
         try:
             update_agent = session.query(VerfierMain).get(agentAttestState.get_agent_id())
@@ -114,6 +116,7 @@ def store_attestation_state(agentAttestState):
             update_agent.ima_pcrs = list(ima_pcrs_dict.keys())
             for pcr_num, value in ima_pcrs_dict.items():
                 setattr(update_agent, 'pcr%d' % pcr_num, value)
+            update_agent.learned_ima_keyrings = agentAttestState.get_ima_keyrings().to_json()
             try:
                 session.add(update_agent)
             except SQLAlchemyError as e:
@@ -155,23 +158,23 @@ class BaseHandler(tornado.web.RequestHandler):
 class MainHandler(tornado.web.RequestHandler):
 
     def head(self):
-        config.echo_json_response(
+        web_util.echo_json_response(
             self, 405, "Not Implemented: Use /agents/ interface instead")
 
     def get(self):
-        config.echo_json_response(
+        web_util.echo_json_response(
             self, 405, "Not Implemented: Use /agents/ interface instead")
 
     def delete(self):
-        config.echo_json_response(
+        web_util.echo_json_response(
             self, 405, "Not Implemented: Use /agents/ interface instead")
 
     def post(self):
-        config.echo_json_response(
+        web_util.echo_json_response(
             self, 405, "Not Implemented: Use /agents/ interface instead")
 
     def put(self):
-        config.echo_json_response(
+        web_util.echo_json_response(
             self, 405, "Not Implemented: Use /agents/ interface instead")
 
     def data_received(self, chunk):
@@ -180,17 +183,17 @@ class MainHandler(tornado.web.RequestHandler):
 class VersionHandler(BaseHandler):
 
     def head(self):
-        config.echo_json_response(
+        web_util.echo_json_response(
             self, 405, "Not Implemented: Use GET interface instead")
 
     def get(self):
-        rest_params = config.get_restful_params(self.request.uri)
+        rest_params = web_util.get_restful_params(self.request.uri)
         if rest_params is None:
-            config.echo_json_response(self, 405, "Not Implemented")
+            web_util.echo_json_response(self, 405, "Not Implemented")
             return
 
         if "version" not in rest_params:
-            config.echo_json_response(self, 400, "URI not supported")
+            web_util.echo_json_response(self, 400, "URI not supported")
             logger.warning('GET returning 400 response. URI not supported: %s', self.request.path)
             return
 
@@ -199,18 +202,18 @@ class VersionHandler(BaseHandler):
             "supported_versions": keylime_api_version.all_versions(),
         }
 
-        config.echo_json_response(self, 200, "Success", version_info)
+        web_util.echo_json_response(self, 200, "Success", version_info)
 
     def delete(self):
-        config.echo_json_response(
+        web_util.echo_json_response(
             self, 405, "Not Implemented: Use GET interface instead")
 
     def post(self):
-        config.echo_json_response(
+        web_util.echo_json_response(
             self, 405, "Not Implemented: Use GET interface instead")
 
     def put(self):
-        config.echo_json_response(
+        web_util.echo_json_response(
             self, 405, "Not Implemented: Use GET interface instead")
 
     def data_received(self, chunk):
@@ -220,7 +223,7 @@ class VersionHandler(BaseHandler):
 class AgentsHandler(BaseHandler):
     def head(self):
         """HEAD not supported"""
-        config.echo_json_response(self, 405, "HEAD not supported")
+        web_util.echo_json_response(self, 405, "HEAD not supported")
 
     def get(self):
         """This method handles the GET requests to retrieve status on agents from the Cloud Verifier.
@@ -232,18 +235,18 @@ class AgentsHandler(BaseHandler):
         to contact the Cloud Agent.
         """
         session = get_session()
-        rest_params = config.get_restful_params(self.request.uri)
+        rest_params = web_util.get_restful_params(self.request.uri)
         if rest_params is None:
-            config.echo_json_response(
+            web_util.echo_json_response(
                 self, 405, "Not Implemented: Use /agents/ interface")
             return
 
         if not rest_params["api_version"]:
-            config.echo_json_response(self, 400, "API Version not supported")
+            web_util.echo_json_response(self, 400, "API Version not supported")
             return
 
         if "agents" not in rest_params:
-            config.echo_json_response(self, 400, "uri not supported")
+            web_util.echo_json_response(self, 400, "uri not supported")
             logger.warning('GET returning 400 response. uri not supported: %s', self.request.path)
             return
 
@@ -258,9 +261,9 @@ class AgentsHandler(BaseHandler):
 
             if agent is not None:
                 response = cloud_verifier_common.process_get_status(agent)
-                config.echo_json_response(self, 200, "Success", response)
+                web_util.echo_json_response(self, 200, "Success", response)
             else:
-                config.echo_json_response(self, 404, "agent id not found")
+                web_util.echo_json_response(self, 404, "agent id not found")
         else:
             json_response = None
             if "bulk" in rest_params.keys():
@@ -275,7 +278,7 @@ class AgentsHandler(BaseHandler):
                 for agent in agent_list:
                     json_response[agent.agent_id] = cloud_verifier_common.process_get_status(agent)
 
-                config.echo_json_response(self, 200, "Success", json_response)
+                web_util.echo_json_response(self, 200, "Success", json_response)
             else:
                 if ("verifier" in rest_params.keys()) and (rest_params["verifier"] != ''):
                     json_response = session.query(VerfierMain.agent_id).filter_by(
@@ -283,7 +286,7 @@ class AgentsHandler(BaseHandler):
                 else:
                     json_response = session.query(VerfierMain.agent_id).all()
 
-                config.echo_json_response(self, 200, "Success", {
+                web_util.echo_json_response(self, 200, "Success", {
                     'uuids': json_response})
 
             logger.info('GET returning 200 response for agent_id list')
@@ -295,24 +298,24 @@ class AgentsHandler(BaseHandler):
         agents requests require a single agent_id parameter which identifies the agent to be deleted.
         """
         session = get_session()
-        rest_params = config.get_restful_params(self.request.uri)
+        rest_params = web_util.get_restful_params(self.request.uri)
         if rest_params is None:
-            config.echo_json_response(
+            web_util.echo_json_response(
                 self, 405, "Not Implemented: Use /agents/ interface")
             return
 
         if not rest_params["api_version"]:
-            config.echo_json_response(self, 400, "API Version not supported")
+            web_util.echo_json_response(self, 400, "API Version not supported")
             return
 
         if "agents" not in rest_params:
-            config.echo_json_response(self, 400, "uri not supported")
+            web_util.echo_json_response(self, 400, "uri not supported")
             return
 
         agent_id = rest_params["agents"]
 
         if agent_id is None:
-            config.echo_json_response(self, 400, "uri not supported")
+            web_util.echo_json_response(self, 400, "uri not supported")
             logger.warning('DELETE returning 400 response. uri not supported: %s', self.request.path)
             return
 
@@ -323,13 +326,13 @@ class AgentsHandler(BaseHandler):
             logger.error('SQLAlchemy Error: %s', e)
 
         if agent is None:
-            config.echo_json_response(self, 404, "agent id not found")
+            web_util.echo_json_response(self, 404, "agent id not found")
             logger.info('DELETE returning 404 response. agent id: %s not found.', agent_id)
             return
 
-        verifier_id = config.get('cloud_verifier', 'cloudverifier_id', cloud_verifier_common.DEFAULT_VERIFIER_ID)
+        verifier_id = config.get('cloud_verifier', 'cloudverifier_id', fallback=cloud_verifier_common.DEFAULT_VERIFIER_ID)
         if verifier_id != agent.verifier_id:
-            config.echo_json_response(self, 404, "agent id associated to this verifier")
+            web_util.echo_json_response(self, 404, "agent id associated to this verifier")
             logger.info('DELETE returning 404 response. agent id: %s not associated to this verifer.', agent_id)
             return
 
@@ -340,7 +343,7 @@ class AgentsHandler(BaseHandler):
                 verifier_db_delete_agent(session, agent_id)
             except SQLAlchemyError as e:
                 logger.error('SQLAlchemy Error: %s', e)
-            config.echo_json_response(self, 200, "Success")
+            web_util.echo_json_response(self, 200, "Success")
             logger.info('DELETE returning 200 response for agent id: %s', agent_id)
         else:
             try:
@@ -351,7 +354,7 @@ class AgentsHandler(BaseHandler):
                 except SQLAlchemyError as e:
                     logger.error('SQLAlchemy Error: %s', e)
                 session.commit()
-                config.echo_json_response(self, 202, "Accepted")
+                web_util.echo_json_response(self, 202, "Accepted")
                 logger.info('DELETE returning 202 response for agent id: %s', agent_id)
             except SQLAlchemyError as e:
                 logger.error('SQLAlchemy Error: %s', e)
@@ -364,18 +367,18 @@ class AgentsHandler(BaseHandler):
         """
         session = get_session()
         try:
-            rest_params = config.get_restful_params(self.request.uri)
+            rest_params = web_util.get_restful_params(self.request.uri)
             if rest_params is None:
-                config.echo_json_response(
+                web_util.echo_json_response(
                     self, 405, "Not Implemented: Use /agents/ interface")
                 return
 
             if not rest_params["api_version"]:
-                config.echo_json_response(self, 400, "API Version not supported")
+                web_util.echo_json_response(self, 400, "API Version not supported")
                 return
 
             if "agents" not in rest_params:
-                config.echo_json_response(self, 400, "uri not supported")
+                web_util.echo_json_response(self, 400, "uri not supported")
                 logger.warning('POST returning 400 response. uri not supported: %s', self.request.path)
                 return
 
@@ -384,7 +387,7 @@ class AgentsHandler(BaseHandler):
             if agent_id is not None:
                 content_length = len(self.request.body)
                 if content_length == 0:
-                    config.echo_json_response(
+                    web_util.echo_json_response(
                         self, 400, "Expected non zero content length")
                     logger.warning('POST returning 400 response. Expected non zero content length.')
                 else:
@@ -411,15 +414,16 @@ class AgentsHandler(BaseHandler):
                     agent_data['agent_id'] = agent_id
                     agent_data['boottime'] = 0
                     agent_data['ima_pcrs'] = []
-                    agent_data['pcr10'] = START_HASH
+                    agent_data['pcr10'] = None
                     agent_data['next_ima_ml_entry'] = 0
-                    agent_data['verifier_id'] = config.get('cloud_verifier', 'cloudverifier_id', cloud_verifier_common.DEFAULT_VERIFIER_ID)
+                    agent_data['learned_ima_keyrings'] = {}
+                    agent_data['verifier_id'] = config.get('cloud_verifier', 'cloudverifier_id', fallback=cloud_verifier_common.DEFAULT_VERIFIER_ID)
                     agent_data['verifier_ip'] = config.get('cloud_verifier', 'cloudverifier_ip')
                     agent_data['verifier_port'] = config.get('cloud_verifier', 'cloudverifier_port')
 
                     is_valid, err_msg = cloud_verifier_common.validate_agent_data(agent_data)
                     if not is_valid:
-                        config.echo_json_response(self, 400, err_msg)
+                        web_util.echo_json_response(self, 400, err_msg)
                         logger.warning(err_msg)
                         return
 
@@ -428,11 +432,12 @@ class AgentsHandler(BaseHandler):
                             VerfierMain).filter_by(agent_id=agent_id).count()
                     except SQLAlchemyError as e:
                         logger.error('SQLAlchemy Error: %s', e)
+                        raise e
 
                     # don't allow overwriting
 
                     if new_agent_count > 0:
-                        config.echo_json_response(
+                        web_util.echo_json_response(
                             self, 409, "Agent of uuid %s already exists" % (agent_id))
                         logger.warning("Agent of uuid %s already exists", agent_id)
                     else:
@@ -442,22 +447,21 @@ class AgentsHandler(BaseHandler):
                             session.commit()
                         except SQLAlchemyError as e:
                             logger.error('SQLAlchemy Error: %s', e)
+                            raise e
 
                         for key in list(exclude_db.keys()):
                             agent_data[key] = exclude_db[key]
                         asyncio.ensure_future(
                             process_agent(agent_data, states.GET_QUOTE))
-                        config.echo_json_response(self, 200, "Success")
+                        web_util.echo_json_response(self, 200, "Success")
                         logger.info('POST returning 200 response for adding agent id: %s', agent_id)
             else:
-                config.echo_json_response(self, 400, "uri not supported")
+                web_util.echo_json_response(self, 400, "uri not supported")
                 logger.warning("POST returning 400 response. uri not supported")
         except Exception as e:
-            config.echo_json_response(self, 400, "Exception error: %s" % e)
+            web_util.echo_json_response(self, 400, "Exception error: %s" % e)
             logger.warning("POST returning 400 response. Exception error: %s", e)
             logger.exception(e)
-
-        self.finish()
 
     def put(self):
         """This method handles the PUT requests to add agents to the Cloud Verifier.
@@ -467,35 +471,36 @@ class AgentsHandler(BaseHandler):
         """
         session = get_session()
         try:
-            rest_params = config.get_restful_params(self.request.uri)
+            rest_params = web_util.get_restful_params(self.request.uri)
             if rest_params is None:
-                config.echo_json_response(
+                web_util.echo_json_response(
                     self, 405, "Not Implemented: Use /agents/ interface")
                 return
 
             if not rest_params["api_version"]:
-                config.echo_json_response(self, 400, "API Version not supported")
+                web_util.echo_json_response(self, 400, "API Version not supported")
                 return
 
             if "agents" not in rest_params:
-                config.echo_json_response(self, 400, "uri not supported")
+                web_util.echo_json_response(self, 400, "uri not supported")
                 logger.warning('PUT returning 400 response. uri not supported: %s', self.request.path)
                 return
 
             agent_id = rest_params["agents"]
 
             if agent_id is None:
-                config.echo_json_response(self, 400, "uri not supported")
+                web_util.echo_json_response(self, 400, "uri not supported")
                 logger.warning("PUT returning 400 response. uri not supported")
             try:
-                verifier_id = config.get('cloud_verifier', 'cloudverifier_id', cloud_verifier_common.DEFAULT_VERIFIER_ID)
+                verifier_id = config.get('cloud_verifier', 'cloudverifier_id', fallback=cloud_verifier_common.DEFAULT_VERIFIER_ID)
                 agent = session.query(VerfierMain).filter_by(
                     agent_id=agent_id, verifier_id=verifier_id).one()
             except SQLAlchemyError as e:
                 logger.error('SQLAlchemy Error: %s', e)
+                raise e
 
             if agent is None:
-                config.echo_json_response(self, 404, "agent id not found")
+                web_util.echo_json_response(self, 404, "agent id not found")
                 logger.info('PUT returning 404 response. agent id: %s not found.', agent_id)
                 return
 
@@ -503,7 +508,7 @@ class AgentsHandler(BaseHandler):
                 agent.operational_state = states.START
                 asyncio.ensure_future(
                     process_agent(agent, states.GET_QUOTE))
-                config.echo_json_response(self, 200, "Success")
+                web_util.echo_json_response(self, 200, "Success")
                 logger.info('PUT returning 200 response for agent id: %s', agent_id)
             elif "stop" in rest_params:
                 # do stuff for terminate
@@ -515,17 +520,16 @@ class AgentsHandler(BaseHandler):
                 except SQLAlchemyError as e:
                     logger.error('SQLAlchemy Error: %s', e)
 
-                config.echo_json_response(self, 200, "Success")
+                web_util.echo_json_response(self, 200, "Success")
                 logger.info('PUT returning 200 response for agent id: %s', agent_id)
             else:
-                config.echo_json_response(self, 400, "uri not supported")
+                web_util.echo_json_response(self, 400, "uri not supported")
                 logger.warning("PUT returning 400 response. uri not supported")
 
         except Exception as e:
-            config.echo_json_response(self, 400, "Exception error: %s" % e)
+            web_util.echo_json_response(self, 400, "Exception error: %s" % e)
             logger.warning("PUT returning 400 response. Exception error: %s", e)
             logger.exception(e)
-        self.finish()
 
     def data_received(self, chunk):
         raise NotImplementedError()
@@ -533,7 +537,7 @@ class AgentsHandler(BaseHandler):
 
 class AllowlistHandler(BaseHandler):
     def head(self):
-        config.echo_json_response(
+        web_util.echo_json_response(
             self, 400, "Allowlist handler: HEAD Not Implemented")
 
     def get(self):
@@ -542,18 +546,18 @@ class AllowlistHandler(BaseHandler):
         GET /allowlists/{name}
         """
 
-        rest_params = config.get_restful_params(self.request.uri)
+        rest_params = web_util.get_restful_params(self.request.uri)
         if rest_params is None or 'allowlists' not in rest_params:
-            config.echo_json_response(self, 400, "Invalid URL")
+            web_util.echo_json_response(self, 400, "Invalid URL")
             return
 
         if not rest_params["api_version"]:
-            config.echo_json_response(self, 400, "API Version not supported")
+            web_util.echo_json_response(self, 400, "API Version not supported")
             return
 
         allowlist_name = rest_params['allowlists']
         if allowlist_name is None:
-            config.echo_json_response(self, 400, "Invalid URL")
+            web_util.echo_json_response(self, 400, "Invalid URL")
             logger.warning(
                 'GET returning 400 response: ' + self.request.path)
             return
@@ -563,17 +567,17 @@ class AllowlistHandler(BaseHandler):
             allowlist = session.query(VerifierAllowlist).filter_by(
                 name=allowlist_name).one()
         except NoResultFound:
-            config.echo_json_response(self, 404, "Allowlist %s not found" % allowlist_name)
+            web_util.echo_json_response(self, 404, "Allowlist %s not found" % allowlist_name)
             return
         except SQLAlchemyError as e:
             logger.error(f'SQLAlchemy Error: {e}')
-            config.echo_json_response(self, 500, "Failed to get allowlist")
+            web_util.echo_json_response(self, 500, "Failed to get allowlist")
             raise
 
         response = {}
         for field in ('name', 'tpm_policy', 'vtpm_policy', 'ima_policy'):
             response[field] = getattr(allowlist, field, None)
-        config.echo_json_response(self, 200, 'Success', response)
+        web_util.echo_json_response(self, 200, 'Success', response)
 
     def delete(self):
         """Delete an allowlist
@@ -581,18 +585,18 @@ class AllowlistHandler(BaseHandler):
         DELETE /allowlists/{name}
         """
 
-        rest_params = config.get_restful_params(self.request.uri)
+        rest_params = web_util.get_restful_params(self.request.uri)
         if rest_params is None or 'allowlists' not in rest_params:
-            config.echo_json_response(self, 400, "Invalid URL")
+            web_util.echo_json_response(self, 400, "Invalid URL")
             return
 
         if not rest_params["api_version"]:
-            config.echo_json_response(self, 400, "API Version not supported")
+            web_util.echo_json_response(self, 400, "API Version not supported")
             return
 
         allowlist_name = rest_params['allowlists']
         if allowlist_name is None:
-            config.echo_json_response(self, 400, "Invalid URL")
+            web_util.echo_json_response(self, 400, "Invalid URL")
             logger.warning(
                 'DELETE returning 400 response: ' + self.request.path)
             return
@@ -602,11 +606,11 @@ class AllowlistHandler(BaseHandler):
             session.query(VerifierAllowlist).filter_by(
                 name=allowlist_name).one()
         except NoResultFound:
-            config.echo_json_response(self, 404, "Allowlist %s not found" % allowlist_name)
+            web_util.echo_json_response(self, 404, "Allowlist %s not found" % allowlist_name)
             return
         except SQLAlchemyError as e:
             logger.error(f'SQLAlchemy Error: {e}')
-            config.echo_json_response(self, 500, "Failed to get allowlist")
+            web_util.echo_json_response(self, 500, "Failed to get allowlist")
             raise
 
         try:
@@ -615,7 +619,7 @@ class AllowlistHandler(BaseHandler):
             session.commit()
         except SQLAlchemyError as e:
             logger.error(f'SQLAlchemy Error: {e}')
-            config.echo_json_response(self, 500, "Failed to get allowlist")
+            web_util.echo_json_response(self, 500, "Failed to get allowlist")
             raise
 
         # NOTE(kaifeng) 204 Can not have response body, but current helper
@@ -633,23 +637,23 @@ class AllowlistHandler(BaseHandler):
         body: {"tpm_policy": {..}, "vtpm_policy": {..}
         """
 
-        rest_params = config.get_restful_params(self.request.uri)
+        rest_params = web_util.get_restful_params(self.request.uri)
         if rest_params is None or 'allowlists' not in rest_params:
-            config.echo_json_response(self, 400, "Invalid URL")
+            web_util.echo_json_response(self, 400, "Invalid URL")
             return
 
         if not rest_params["api_version"]:
-            config.echo_json_response(self, 400, "API Version not supported")
+            web_util.echo_json_response(self, 400, "API Version not supported")
             return
 
         allowlist_name = rest_params['allowlists']
         if allowlist_name is None:
-            config.echo_json_response(self, 400, "Invalid URL")
+            web_util.echo_json_response(self, 400, "Invalid URL")
             return
 
         content_length = len(self.request.body)
         if content_length == 0:
-            config.echo_json_response(
+            web_util.echo_json_response(
                 self, 400, "Expected non zero content length")
             logger.warning(
                 'POST returning 400 response. Expected non zero content length.')
@@ -674,7 +678,7 @@ class AllowlistHandler(BaseHandler):
             al_count = session.query(
                 VerifierAllowlist).filter_by(name=allowlist_name).count()
             if al_count > 0:
-                config.echo_json_response(
+                web_util.echo_json_response(
                     self, 409, "Allowlist with name %s already exists" % allowlist_name)
                 logger.warning(
                     "Allowlist with name %s already exists" % allowlist_name)
@@ -691,11 +695,11 @@ class AllowlistHandler(BaseHandler):
             logger.error(f'SQLAlchemy Error: {e}')
             raise
 
-        config.echo_json_response(self, 201)
+        web_util.echo_json_response(self, 201)
         logger.info('POST returning 201')
 
     def put(self):
-        config.echo_json_response(
+        web_util.echo_json_response(
             self, 400, "Allowlist handler: PUT Not Implemented")
 
     def data_received(self, chunk):
@@ -720,7 +724,7 @@ async def invoke_get_quote(agent, need_pubkey):
 
     if response.status_code != 200:
         # this is a connection error, retry get quote
-        if response.status_code == 599:
+        if response.status_code in [500, 599]:
             asyncio.ensure_future(process_agent(
                 agent, states.GET_QUOTE_RETRY))
         else:
@@ -768,13 +772,13 @@ async def invoke_provide_v(agent):
     response = await res
 
     if response.status_code != 200:
-        if response.status_code == 599:
+        if response.status_code in [500, 599]:
             asyncio.ensure_future(
                 process_agent(agent, states.PROVIDE_V_RETRY))
         else:
             # catastrophic error, do not continue
             logger.critical("Unexpected Provide V response error for cloud agent %s, Error: %s", agent['agent_id'], response.status_code)
-            failure.add_event("no_v", {"message": "Unexpected provide V response", "data": response.error}, False)
+            failure.add_event("no_v", {"message": "Unexpected provide V response", "data": response.status_code}, False)
             asyncio.ensure_future(process_agent(agent, states.FAILED, failure))
     else:
         asyncio.ensure_future(process_agent(agent, states.GET_QUOTE))
@@ -948,7 +952,7 @@ async def activate_agents(verifier_id, verifier_ip, verifier_port):
                 ima_pcrs_dict = {}
                 for pcr_num in agent.ima_pcrs:
                     ima_pcrs_dict[pcr_num] = getattr(agent, 'pcr%d' % pcr_num)
-                aas.add(agent.agent_id, agent.boottime, ima_pcrs_dict, agent.next_ima_ml_entry)
+                aas.add(agent.agent_id, agent.boottime, ima_pcrs_dict, agent.next_ima_ml_entry, agent.learned_ima_keyrings)
         session.commit()
     except SQLAlchemyError as e:
         logger.error('SQLAlchemy Error: %s', e)
@@ -967,7 +971,7 @@ def main():
 
     cloudverifier_port = config.get('cloud_verifier', 'cloudverifier_port')
     cloudverifier_host = config.get('cloud_verifier', 'cloudverifier_ip')
-    cloudverifier_id = config.get('cloud_verifier', 'cloudverifier_id', cloud_verifier_common.DEFAULT_VERIFIER_ID)
+    cloudverifier_id = config.get('cloud_verifier', 'cloudverifier_id', fallback=cloud_verifier_common.DEFAULT_VERIFIER_ID)
 
     # allow tornado's max upload size to be configurable
     max_upload_size = None
@@ -1002,28 +1006,29 @@ def main():
         (r".*", MainHandler),
     ])
 
-    context = cloud_verifier_common.init_mtls()
-
-    # after TLS is up, start revocation notifier
-    if config.getboolean('cloud_verifier', 'revocation_notifier'):
-        logger.info("Starting service for revocation notifications on port %s", config.getint('cloud_verifier', 'revocation_notifier_port'))
-        revocation_notifier.start_broker()
+    context = web_util.init_mtls(logger=logger)
 
     sockets = tornado.netutil.bind_sockets(
         int(cloudverifier_port), address=cloudverifier_host)
-    task_id = tornado.process.fork_processes(config.getint(
-        'cloud_verifier', 'multiprocessing_pool_num_workers'))
-    asyncio.set_event_loop(asyncio.new_event_loop())
-    # Auto reactivate agent
-    if task_id == 0:
-        asyncio.ensure_future(activate_agents(cloudverifier_id, cloudverifier_host, cloudverifier_port))
 
     server = tornado.httpserver.HTTPServer(app, ssl_options=context, max_buffer_size=max_upload_size)
     server.add_sockets(sockets)
 
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+
     try:
-        tornado.ioloop.IOLoop.instance().start()
-    except KeyboardInterrupt:
-        tornado.ioloop.IOLoop.instance().stop()
-        if config.getboolean('cloud_verifier', 'revocation_notifier'):
+        server.start(config.getint('cloud_verifier', 'multiprocessing_pool_num_workers'))
+        if tornado.process.task_id() == 0:
+            # Start the revocation notifier only on one process
+            if config.getboolean('cloud_verifier', 'revocation_notifier'):
+                logger.info("Starting service for revocation notifications on port %s",
+                            config.getint('cloud_verifier', 'revocation_notifier_port'))
+                revocation_notifier.start_broker()
+            # Auto activate agents
+            asyncio.ensure_future(activate_agents(cloudverifier_id, cloudverifier_host, cloudverifier_port))
+
+        tornado.ioloop.IOLoop.current().start()
+    except (KeyboardInterrupt, SystemExit):
+        tornado.ioloop.IOLoop.current().stop()
+        if tornado.process.task_id() == 0 and config.getboolean('cloud_verifier', 'revocation_notifier'):
             revocation_notifier.stop_broker()
