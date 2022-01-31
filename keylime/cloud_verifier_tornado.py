@@ -8,6 +8,7 @@ import traceback
 import sys
 import functools
 import asyncio
+import os
 
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm.exc import NoResultFound
@@ -16,8 +17,9 @@ import tornado.web
 
 from keylime import config
 from keylime import json
+from keylime import registrar_client
 from keylime.agentstates import AgentAttestStates
-from keylime.common import states
+from keylime.common import states, validators
 from keylime.db.verifier_db import VerfierMain
 from keylime.db.verifier_db import VerifierAllowlist
 from keylime.db.keylime_db import DBEngineManager, SessionManager
@@ -63,6 +65,7 @@ exclude_db = {
     'pcr10': '',
     'next_ima_ml_entry': 0,
     'learned_ima_keyrings': {},
+    'ssl_context': None,
 }
 
 
@@ -90,7 +93,11 @@ def _from_db_obj(agent_db_obj):
                 'ima_pcrs', \
                 'pcr10', \
                 'next_ima_ml_entry', \
-                'learned_ima_keyrings' ]
+                'learned_ima_keyrings',
+                'supported_version',
+                'mtls_cert',
+                'ak_tpm',
+               ]
     agent_dict = {}
     for field in fields:
         agent_dict[field] = getattr(agent_db_obj, field, None)
@@ -221,6 +228,11 @@ class VersionHandler(BaseHandler):
 
 
 class AgentsHandler(BaseHandler):
+    mtls_options = None  # Stores the cert, key and password used by the verifier for mTLS connections
+
+    def initialize(self, mtls_options):
+        self.mtls_options = mtls_options
+
     def head(self):
         """HEAD not supported"""
         web_util.echo_json_response(self, 405, "HEAD not supported")
@@ -253,6 +265,13 @@ class AgentsHandler(BaseHandler):
         agent_id = rest_params["agents"]
 
         if (agent_id is not None) and (agent_id != ''):
+            # If the agent ID is not valid (wrong set of characters),
+            # just do nothing.
+            if not validators.valid_agent_id(agent_id):
+                web_util.echo_json_response(self, 400, "agent_id not not valid")
+                logger.error("GET received an invalid agent ID: %s", agent_id)
+                return
+
             try:
                 agent = session.query(VerfierMain).filter_by(
                     agent_id=agent_id).one_or_none()
@@ -317,6 +336,13 @@ class AgentsHandler(BaseHandler):
         if agent_id is None:
             web_util.echo_json_response(self, 400, "uri not supported")
             logger.warning('DELETE returning 400 response. uri not supported: %s', self.request.path)
+            return
+
+        # If the agent ID is not valid (wrong set of characters), just
+        # do nothing.
+        if not validators.valid_agent_id(agent_id):
+            web_util.echo_json_response(self, 400, "agent_id not not valid")
+            logger.error("DELETE received an invalid agent ID: %s", agent_id)
             return
 
         try:
@@ -385,6 +411,13 @@ class AgentsHandler(BaseHandler):
             agent_id = rest_params["agents"]
 
             if agent_id is not None:
+                # If the agent ID is not valid (wrong set of
+                # characters), just do nothing.
+                if not validators.valid_agent_id(agent_id):
+                    web_util.echo_json_response(self, 400, "agent_id not not valid")
+                    logger.error("POST received an invalid agent ID: %s", agent_id)
+                    return
+
                 content_length = len(self.request.body)
                 if content_length == 0:
                     web_util.echo_json_response(
@@ -408,6 +441,7 @@ class AgentsHandler(BaseHandler):
                     agent_data['accept_tpm_hash_algs'] = json_body['accept_tpm_hash_algs']
                     agent_data['accept_tpm_encryption_algs'] = json_body['accept_tpm_encryption_algs']
                     agent_data['accept_tpm_signing_algs'] = json_body['accept_tpm_signing_algs']
+                    agent_data['supported_version'] = json_body['supported_version']
                     agent_data['hash_alg'] = ""
                     agent_data['enc_alg'] = ""
                     agent_data['sign_alg'] = ""
@@ -420,6 +454,25 @@ class AgentsHandler(BaseHandler):
                     agent_data['verifier_id'] = config.get('cloud_verifier', 'cloudverifier_id', fallback=cloud_verifier_common.DEFAULT_VERIFIER_ID)
                     agent_data['verifier_ip'] = config.get('cloud_verifier', 'cloudverifier_ip')
                     agent_data['verifier_port'] = config.get('cloud_verifier', 'cloudverifier_port')
+
+                    # We fetch the registrar data directly here because we require it for connecting to the agent
+                    # using mTLS
+                    registrar_client.init_client_tls('cloud_verifier')
+                    registrar_data = registrar_client.getData(config.get("cloud_verifier", "registrar_ip"),
+                                                              config.get("cloud_verifier", "registrar_port"), agent_id)
+                    if registrar_data is None:
+                        web_util.echo_json_response(self, 400,
+                                                    f"Data for agent {agent_id} could not be found in registrar!")
+                        logger.warning(f"Data for agent {agent_id} could not be found in registrar!")
+                        return
+
+                    agent_data['mtls_cert'] = registrar_data.get('mtls_cert', None)
+                    agent_data['ak_tpm'] = registrar_data['aik_tpm']
+
+                    # TODO: Always error for v1.0 version after initial upgrade
+                    if registrar_data.get('mtls_cert', None) is None and agent_data['supported_version'] != "1.0":
+                        web_util.echo_json_response(self, 400, "mTLS certificate for agent is required!")
+                        return
 
                     is_valid, err_msg = cloud_verifier_common.validate_agent_data(agent_data)
                     if not is_valid:
@@ -451,6 +504,18 @@ class AgentsHandler(BaseHandler):
 
                         for key in list(exclude_db.keys()):
                             agent_data[key] = exclude_db[key]
+
+                        # Prepare SSLContext for mTLS connections
+                        # TODO: drop special handling after initial upgrade
+                        mtls_cert = registrar_data.get('mtls_cert', None)
+                        agent_data['ssl_context'] = None
+                        if mtls_cert:
+                            agent_data['ssl_context'] = web_util.generate_agent_mtls_context(mtls_cert,
+                                                                                             self.mtls_options)
+
+                        if agent_data['ssl_context'] is None:
+                            logger.warning('Connecting to agent without mTLS: %s', agent_id)
+
                         asyncio.ensure_future(
                             process_agent(agent_data, states.GET_QUOTE))
                         web_util.echo_json_response(self, 200, "Success")
@@ -491,6 +556,14 @@ class AgentsHandler(BaseHandler):
             if agent_id is None:
                 web_util.echo_json_response(self, 400, "uri not supported")
                 logger.warning("PUT returning 400 response. uri not supported")
+
+            # If the agent ID is not valid (wrong set of characters),
+            # just do nothing.
+            if not validators.valid_agent_id(agent_id):
+                web_util.echo_json_response(self, 400, "agent_id not not valid")
+                logger.error("PUT received an invalid agent ID: %s", agent_id)
+                return
+
             try:
                 verifier_id = config.get('cloud_verifier', 'cloudverifier_id', fallback=cloud_verifier_common.DEFAULT_VERIFIER_ID)
                 agent = session.query(VerfierMain).filter_by(
@@ -505,7 +578,11 @@ class AgentsHandler(BaseHandler):
                 return
 
             if "reactivate" in rest_params:
-                agent.operational_state = states.START
+                if not isinstance(agent, dict):
+                    agent = _from_db_obj(agent)
+                if agent["mtls_cert"]:
+                    agent['ssl_context'] = web_util.generate_agent_mtls_context(agent["mtls_cert"], self.mtls_options)
+                agent["operational_state"] = states.START
                 asyncio.ensure_future(
                     process_agent(agent, states.GET_QUOTE))
                 web_util.echo_json_response(self, 200, "Success")
@@ -716,10 +793,17 @@ async def invoke_get_quote(agent, need_pubkey):
     if need_pubkey:
         partial_req = "0"
 
-    version = keylime_api_version.current_version()
-    res = tornado_requests.request("GET",
-                                   "http://%s:%d/v%s/quotes/integrity?nonce=%s&mask=%s&vmask=%s&partial=%s&ima_ml_entry=%d" %
-                                   (agent['ip'], agent['port'], version, params["nonce"], params["mask"], params['vmask'], partial_req, params['ima_ml_entry']), context=None)
+    # TODO: remove special handling after initial upgrade
+    if agent['ssl_context']:
+        res = tornado_requests.request("GET",
+                                       "https://%s:%d/v%s/quotes/integrity?nonce=%s&mask=%s&vmask=%s&partial=%s&ima_ml_entry=%d" %
+                                       (agent['ip'], agent['port'], agent['supported_version'], params["nonce"], params["mask"], params['vmask'], partial_req, params['ima_ml_entry']),
+                                       context=agent['ssl_context'])
+    else:
+        res = tornado_requests.request("GET",
+                                       "http://%s:%d/v%s/quotes/integrity?nonce=%s&mask=%s&vmask=%s&partial=%s&ima_ml_entry=%d" %
+                                       (agent['ip'], agent['port'], agent['supported_version'], params["nonce"], params["mask"],
+                                        params['vmask'], partial_req, params['ima_ml_entry']))
     response = await res
 
     if response.status_code != 200:
@@ -766,9 +850,17 @@ async def invoke_provide_v(agent):
     except KeyError:
         pass
     v_json_message = cloud_verifier_common.prepare_v(agent)
-    version = keylime_api_version.current_version()
-    res = tornado_requests.request(
-        "POST", "http://%s:%d/v%s/keys/vkey" % (agent['ip'], agent['port'], version), data=v_json_message)
+
+    # TODO: remove special handling after initial upgrade
+    if agent['ssl_context']:
+        res = tornado_requests.request(
+            "POST", "https://%s:%d/v%s/keys/vkey" % (agent['ip'], agent['port'], agent['supported_version']),
+            data=v_json_message, context=agent['ssl_context'])
+    else:
+        res = tornado_requests.request(
+            "POST", "http://%s:%d/v%s/keys/vkey" % (agent['ip'], agent['port'], agent['supported_version']),
+            data=v_json_message)
+
     response = await res
 
     if response.status_code != 200:
@@ -937,7 +1029,7 @@ async def process_agent(agent, new_operational_state, failure=Failure(Component.
         logger.exception(e)
 
 
-async def activate_agents(verifier_id, verifier_ip, verifier_port):
+async def activate_agents(verifier_id, verifier_ip, verifier_port, mtls_options):
     session = get_session()
     aas = get_AgentAttestStates()
     try:
@@ -946,8 +1038,11 @@ async def activate_agents(verifier_id, verifier_ip, verifier_port):
         for agent in agents:
             agent.verifier_ip = verifier_ip
             agent.verifier_host = verifier_port
+            agent_run = _from_db_obj(agent)
+            if agent_run["mtls_cert"]:
+                agent_run["ssl_context"] = web_util.generate_agent_mtls_context(agent_run["mtls_cert"], mtls_options)
             if agent.operational_state == states.START:
-                asyncio.ensure_future(process_agent(agent, states.GET_QUOTE))
+                asyncio.ensure_future(process_agent(agent_run, states.GET_QUOTE))
             if agent.boottime:
                 ima_pcrs_dict = {}
                 for pcr_num in agent.ima_pcrs:
@@ -956,7 +1051,6 @@ async def activate_agents(verifier_id, verifier_ip, verifier_port):
         session.commit()
     except SQLAlchemyError as e:
         logger.error('SQLAlchemy Error: %s', e)
-
 
 def start_tornado(tornado_server, port):
     tornado_server.listen(port)
@@ -977,6 +1071,9 @@ def main():
     max_upload_size = None
     if config.has_option('cloud_verifier', 'max_upload_size'):
         max_upload_size = int(config.get('cloud_verifier', 'max_upload_size'))
+
+    # set a conservative general umask
+    os.umask(0o077)
 
     VerfierMain.metadata.create_all(engine, checkfirst=True)
     session = get_session()
@@ -999,14 +1096,23 @@ def main():
     # print out API versions we support
     keylime_api_version.log_api_versions(logger)
 
+    context, mtls_options = web_util.init_mtls(logger=logger)
+
+    # Check for user defined CA to connect to agent
+    agent_mtls_cert = config.get("cloud_verifier", "agent_mtls_cert", fallback=None)
+    agent_mtls_private_key = config.get("cloud_verifier", "agent_mtls_private_key", fallback=None)
+    agent_mtls_private_key_pw = config.get("cloud_verifier", "agent_mtls_private_key_pw", fallback=None)
+
+    # Only set custom options if the cert should not be the same as used by the verifier
+    if agent_mtls_cert != "CV":
+        mtls_options = (agent_mtls_cert, agent_mtls_private_key, agent_mtls_private_key_pw)
+
     app = tornado.web.Application([
-        (r"/v?[0-9]+(?:\.[0-9]+)?/agents/.*", AgentsHandler),
+        (r"/v?[0-9]+(?:\.[0-9]+)?/agents/.*", AgentsHandler, {"mtls_options": mtls_options}),
         (r"/v?[0-9]+(?:\.[0-9]+)?/allowlists/.*", AllowlistHandler),
         (r"/versions?", VersionHandler),
         (r".*", MainHandler),
     ])
-
-    context = web_util.init_mtls(logger=logger)
 
     sockets = tornado.netutil.bind_sockets(
         int(cloudverifier_port), address=cloudverifier_host)
@@ -1025,7 +1131,7 @@ def main():
                             config.getint('cloud_verifier', 'revocation_notifier_port'))
                 revocation_notifier.start_broker()
             # Auto activate agents
-            asyncio.ensure_future(activate_agents(cloudverifier_id, cloudverifier_host, cloudverifier_port))
+            asyncio.ensure_future(activate_agents(cloudverifier_id, cloudverifier_host, cloudverifier_port, mtls_options))
 
         tornado.ioloop.IOLoop.current().start()
     except (KeyboardInterrupt, SystemExit):

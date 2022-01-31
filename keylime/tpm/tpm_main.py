@@ -5,6 +5,7 @@ Copyright 2017 Massachusetts Institute of Technology.
 
 import base64
 import binascii
+import collections
 import hashlib
 import os
 import re
@@ -239,6 +240,10 @@ class tpm(tpm_abstract.AbstractTPM):
                 raise Exception('Unsupported encryption algorithm specified: %s!' % (defaultEncrypt))
             if defaultSign not in self.supported['sign']:
                 raise Exception('Unsupported signing algorithm specified: %s!' % (defaultSign))
+
+            enabled_pcrs = self.__get_pcrs()
+            if not enabled_pcrs.get(str(defaultHash)):
+                raise Exception(f'No PCR banks enabled for hash algorithm specified: {defaultHash}')
         else:
             # Assume their defaults are sane?
             pass
@@ -307,6 +312,29 @@ class tpm(tpm_abstract.AbstractTPM):
                 self.supported['hash'].add(algorithm)
             elif details["asymmetric"] == 1 and details["signing"] == 1 and algorithms.Sign.is_recognized(algorithm):
                 self.supported['sign'].add(algorithm)
+
+    def __get_pcrs(self):
+        """Gets which PCRs are enabled with which hash algorithm"""
+        if self.tools_version == "3.2":
+            retDict = self.__run(["tpm2_getcap", "-c", "pcrs"])
+        elif self.tools_version in ["4.0", "4.2"]:
+            retDict = self.__run(["tpm2_getcap", "pcrs"])
+
+        output = config.convert(retDict['retout'])
+        errout = config.convert(retDict['reterr'])
+        code = retDict['code']
+
+        if code != tpm_abstract.AbstractTPM.EXIT_SUCESS:
+            raise Exception("get_tpm_algorithms failed with code " + str(code) + ": " + str(errout))
+
+        retyaml = config.yaml_to_dict(output, logger=logger)
+        pcrs = {}
+        if retyaml is None:
+            logger.warning("Could not read YAML output of tpm2_getcap.")
+            return pcrs
+        if "selected-pcrs" in retyaml:
+            pcrs = collections.ChainMap(*retyaml["selected-pcrs"])
+        return pcrs
 
     # tpm_exec
     @staticmethod
@@ -772,7 +800,7 @@ class tpm(tpm_abstract.AbstractTPM):
             f.close()
 
             # read in the aes key
-            key = base64.b64encode(challenge)
+            key = base64.b64encode(challenge).decode("utf-8")
 
         except Exception as e:
             logger.error("Error encrypting AIK: " + str(e))
@@ -895,18 +923,20 @@ class tpm(tpm_abstract.AbstractTPM):
         logger.error("No Root CA matched EK Certificate")
         return False
 
-    def get_tpm_manufacturer(self):
+    def get_tpm_manufacturer(self, output=None):
         vendorStr = None
-        if self.tools_version == "3.2":
-            retDict = self.__run(["tpm2_getcap", "-c", "properties-fixed"])
-        elif self.tools_version in ["4.0", "4.2"]:
-            retDict = self.__run(["tpm2_getcap", "properties-fixed"])
-        output = retDict['retout']
-        reterr = retDict['reterr']
-        code = retDict['code']
+        if not output:
+            if self.tools_version == "3.2":
+                retDict = self.__run(["tpm2_getcap", "-c", "properties-fixed"])
+            elif self.tools_version in ["4.0", "4.2"]:
+                retDict = self.__run(["tpm2_getcap", "properties-fixed"])
+            output = retDict['retout']
+            reterr = retDict['reterr']
+            code = retDict['code']
 
-        if code != tpm_abstract.AbstractTPM.EXIT_SUCESS:
-            raise Exception("get_tpm_manufacturer failed with code " + str(code) + ": " + str(reterr))
+            if code != tpm_abstract.AbstractTPM.EXIT_SUCESS:
+                raise Exception("get_tpm_manufacturer failed with code " + str(code) + ": " + str(reterr))
+
 
         # Clean up TPM manufacturer information (strip control characters)
         # These strings are supposed to be printable ASCII characters, but
@@ -959,7 +989,7 @@ class tpm(tpm_abstract.AbstractTPM):
                 pcr_list.append(str(pcr))
         return ",".join(pcr_list)
 
-    def create_quote(self, nonce, data=None, pcrmask=tpm_abstract.AbstractTPM.EMPTYMASK, hash_alg=None):
+    def create_quote(self, nonce, data=None, pcrmask=tpm_abstract.AbstractTPM.EMPTYMASK, hash_alg=None, compress=False):
         if hash_alg is None:
             hash_alg = self.defaults['hash']
 
@@ -992,11 +1022,15 @@ class tpm(tpm_abstract.AbstractTPM):
                     command = ["tpm2_quote", "-c", keyhandle, "-l", "%s:%s" % (hash_alg, pcrlist), "-q", nonce, "-m", quotepath.name, "-s", sigpath.name, "-o", pcrpath.name, "-g", hash_alg, "-p", aik_pw]
                 retDict = self.__run(command, lock=False, outputpaths=[quotepath.name, sigpath.name, pcrpath.name])
                 quoteraw = retDict['fileouts'][quotepath.name]
-                quote_b64encode = base64.b64encode(zlib.compress(quoteraw))
                 sigraw = retDict['fileouts'][sigpath.name]
-                sigraw_b64encode = base64.b64encode(zlib.compress(sigraw))
                 pcrraw = retDict['fileouts'][pcrpath.name]
-                pcrraw_b64encode = base64.b64encode(zlib.compress(pcrraw))
+                if compress:
+                    quoteraw = zlib.compress(quoteraw)
+                    sigraw = zlib.compress(sigraw)
+                    pcrraw = zlib.compress(pcrraw)
+                quote_b64encode = base64.b64encode(quoteraw)
+                sigraw_b64encode = base64.b64encode(sigraw)
+                pcrraw_b64encode = base64.b64encode(pcrraw)
                 quote = quote_b64encode.decode('utf-8') + ":" + sigraw_b64encode.decode('utf-8') + ":" + pcrraw_b64encode.decode('utf-8')
 
         return 'r' + quote
@@ -1018,12 +1052,13 @@ class tpm(tpm_abstract.AbstractTPM):
         retDict = self.__run(command, lock=False)
         return retDict
 
-    def _tpm2_checkquote(self, aikTpmFromRegistrar, quote, nonce, hash_alg):
+    def _tpm2_checkquote(self, aikTpmFromRegistrar, quote, nonce, hash_alg, compressed):
         """Write the files from data returned from tpm2_quote for running tpm2_checkquote
         :param aikTpmFromRegistrar: AIK used to generate the quote and is needed for verifying it now.
         :param quote: quote data in the format 'r<b64-compressed-quoteblob>:<b64-compressed-sigblob>:<b64-compressed-pcrblob>
         :param nonce: nonce that was used to create the quote
         :param hash_alg: the hash algorithm that was used
+        :param compressed: if the quote data is compressed with zlib or not
         :returns: Returns the 'retout' from running tpm2_checkquote and True in case of success, None and False in case of error.
         This function throws an Exception on bad input.
         """
@@ -1042,9 +1077,16 @@ class tpm(tpm_abstract.AbstractTPM):
         if len(quote_tokens) < 3:
             raise Exception("Quote is not compound! %s" % quote)
 
-        quoteblob = zlib.decompress(base64.b64decode(quote_tokens[0]))
-        sigblob = zlib.decompress(base64.b64decode(quote_tokens[1]))
-        pcrblob = zlib.decompress(base64.b64decode(quote_tokens[2]))
+        quoteblob = base64.b64decode(quote_tokens[0])
+        sigblob = base64.b64decode(quote_tokens[1])
+        pcrblob = base64.b64decode(quote_tokens[2])
+
+        if compressed:
+            logger.warning("Decompressing quote data which is unsafe!")
+            quoteblob = zlib.decompress(quoteblob)
+            sigblob = zlib.decompress(sigblob)
+            pcrblob = zlib.decompress(pcrblob)
+
 
         qfd = sfd = pfd = afd = -1
         quoteFile = None
@@ -1100,12 +1142,12 @@ class tpm(tpm_abstract.AbstractTPM):
 
     def check_quote(self, agentAttestState, nonce, data, quote, aikTpmFromRegistrar, tpm_policy={},
                     ima_measurement_list=None, allowlist={}, hash_alg=None, ima_keyrings=None,
-                    mb_measurement_list=None, mb_refstate=None) -> Failure:
+                    mb_measurement_list=None, mb_refstate=None, compressed=False) -> Failure:
         failure = Failure(Component.QUOTE_VALIDATION)
         if hash_alg is None:
             hash_alg = self.defaults['hash']
 
-        retout, success = self._tpm2_checkquote(aikTpmFromRegistrar, quote, nonce, hash_alg)
+        retout, success = self._tpm2_checkquote(aikTpmFromRegistrar, quote, nonce, hash_alg, compressed)
         if not success:
             # If the quote validation fails we will skip all other steps therefore this failure is irrecoverable.
             failure.add_event("quote_validation", {"message": "Quote validation using tpm2-tools", "data": retout}, False)
@@ -1118,13 +1160,15 @@ class tpm(tpm_abstract.AbstractTPM):
                                                     "data": retout}, False)
             return failure
         if "pcrs" in jsonout:
-            if hash_alg in jsonout["pcrs"]:
+            # The hash algorithm might be in the YAML output but does not contain any data, so we also check that.
+            if hash_alg in jsonout["pcrs"] and jsonout["pcrs"][hash_alg] is not None:
                 alg_size = hash_alg.get_size() // 4
                 for pcrval, hashval in jsonout["pcrs"][hash_alg].items():
                     pcrs.append("PCR " + str(pcrval) + " " + '{0:0{1}x}'.format(hashval, alg_size))
 
         if len(pcrs) == 0:
-            pcrs = None
+            logger.warning("Quote does not contain any PCRs. Make sure that the TPM supports %s PCR banks",
+                           str(hash_alg))
 
         return self.check_pcrs(agentAttestState, tpm_policy, pcrs, data, False, ima_measurement_list, allowlist,
                                ima_keyrings, mb_measurement_list, mb_refstate, hash_alg)

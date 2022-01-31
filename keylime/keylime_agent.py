@@ -9,6 +9,7 @@ import asyncio
 import http.server
 import multiprocessing
 import platform
+import datetime
 import signal
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
@@ -28,12 +29,14 @@ import shutil
 import subprocess
 import psutil
 
+from cryptography import x509
 from cryptography.hazmat.primitives import serialization
 
 from keylime import config
 from keylime import keylime_logging
 from keylime import cmd_exec
 from keylime import crypto
+from keylime import fs_util
 from keylime import ima
 from keylime import json
 from keylime import revocation_notifier
@@ -41,7 +44,7 @@ from keylime import registrar_client
 from keylime import secure_mount
 from keylime import web_util
 from keylime import api_version as keylime_api_version
-from keylime.common import algorithms
+from keylime.common import algorithms, validators
 from keylime.tpm.tpm_main import tpm
 from keylime.tpm.tpm_abstract import TPM_Utilities
 from keylime.tpm.tpm2_objects import pubkey_from_tpm2b_public
@@ -74,7 +77,14 @@ class Handler(BaseHTTPRequestHandler):
         rest_params = web_util.get_restful_params(self.path)
         if rest_params is None:
             web_util.echo_json_response(
-                self, 405, "Not Implemented: Use /keys/ or /quotes/ interfaces")
+                self, 405, "Not Implemented: Use /version, /keys/ or /quotes/ interfaces")
+            return
+
+        if "version" in rest_params:
+            version_info = {
+                "supported_version": keylime_api_version.current_version()
+            }
+            web_util.echo_json_response(self, 200, "Success", version_info)
             return
 
         if not rest_params["api_version"]:
@@ -122,7 +132,7 @@ class Handler(BaseHTTPRequestHandler):
 
             # Sanitization assurance (for tpm.run() tasks below)
             if not (nonce.isalnum() and
-                    (pcrmask is None or config.valid_hex(pcrmask)) and
+                    (pcrmask is None or validators.valid_hex(pcrmask)) and
                     ima_ml_entry.isalnum()):
                 logger.warning('GET quote returning 400 response. parameters should be strictly alphanumeric')
                 web_util.echo_json_response(
@@ -374,6 +384,9 @@ class CloudAgentHTTPServer(ThreadingMixIn, HTTPServer):
     rsaprivatekey = None
     rsapublickey = None
     rsapublickey_exportable = None
+    mtls_cert_path = None
+    rsakey_path = None
+    mtls_cert = None
     done = threading.Event()
     auth_tag = None
     payload = None
@@ -389,6 +402,7 @@ class CloudAgentHTTPServer(ThreadingMixIn, HTTPServer):
         secdir = secure_mount.mount()
         keyname = os.path.join(secdir,
                                config.get('cloud_agent', 'rsa_keyname'))
+        certname = os.path.join(secdir, config.get('cloud_agent', 'mtls_cert'))
         # read or generate the key depending on configuration
         if os.path.isfile(keyname):
             # read in private key
@@ -401,9 +415,25 @@ class CloudAgentHTTPServer(ThreadingMixIn, HTTPServer):
             with open(keyname, "wb") as f:
                 f.write(crypto.rsa_export_privkey(rsa_key))
 
+        self.rsakey_path = keyname
         self.rsaprivatekey = rsa_key
         self.rsapublickey_exportable = crypto.rsa_export_pubkey(
             self.rsaprivatekey)
+
+        if os.path.isfile(certname):
+            logger.debug("Using existing mTLS cert in %s", certname)
+            with open(certname, "rb") as f:
+                mtls_cert = x509.load_pem_x509_certificate(f.read())
+        else:
+            logger.debug("No mTLS certificate found generating a new one")
+            with open(certname, "wb") as f:
+                # By default generate a TLS certificate valid for 5 years
+                valid_util = datetime.datetime.utcnow() + datetime.timedelta(days=(360 * 5))
+                mtls_cert = crypto.generate_selfsigned_cert(agent_uuid, rsa_key, valid_util)
+                f.write(mtls_cert.public_bytes(serialization.Encoding.PEM))
+
+        self.mtls_cert_path = certname
+        self.mtls_cert = mtls_cert
 
         # attempt to get a U value from the TPM NVRAM
         nvram_u = tpm_instance.read_key_nvram()
@@ -502,8 +532,15 @@ def revocation_listener():
     This configures and starts the revocation listener. It is designed to be started in a separate process.
     """
 
-    if not config.getboolean('cloud_agent', 'listen_notfications'):
-        return
+    if config.has_option('cloud_agent', 'listen_notifications'):
+        if not config.getboolean('cloud_agent', 'listen_notifications'):
+            return
+
+    # keep old typo "listen_notfications" around for a few versions
+    if config.has_option('cloud_agent', 'listen_notfications'):
+        logger.warning('Option typo "listen_notfications" is deprecated. Please use "listen_notifications" instead.')
+        if not config.getboolean('cloud_agent', 'listen_notfications'):
+            return
 
     secdir = secure_mount.mount()
 
@@ -599,7 +636,10 @@ def main():
     secure_mount.mount()
 
     # change dir to working dir
-    config.ch_dir(config.WORK_DIR, logger)
+    fs_util.ch_dir(config.WORK_DIR)
+
+    # set a conservative general umask
+    os.umask(0o077)
 
     # initialize tpm
     (ekcert, ek_tpm, aik_tpm) = instance_tpm.tpm_init(self_activate=False, config_pw=config.get(
@@ -609,9 +649,10 @@ def main():
     # Warn if kernel version is <5.10 and another algorithm than SHA1 is used,
     # because otherwise IMA will not work
     kernel_version = tuple(platform.release().split("-")[0].split("."))
-    if kernel_version < ("5", "10", "0") and instance_tpm.defaults["hash"] != algorithms.Hash.SHA1:
-        logger.warning("IMA attestation only works on kernel versions <5.10 with SHA1 as tpm_hash_alg. "
-                       "Current algorithm is: %s", instance_tpm.defaults["hash"])
+    if tuple(map(int,kernel_version)) < (5, 10, 0) and instance_tpm.defaults["hash"] != algorithms.Hash.SHA1:
+        logger.warning("IMA attestation only works on kernel versions <5.10 with SHA1 as hash algorithm. "
+                       "Even if ascii_runtime_measurements shows \"%s\" as the "
+                       "algorithm, it might be just padding zeros", (instance_tpm.defaults["hash"]))
 
     if ekcert is None:
         if virtual_agent:
@@ -646,6 +687,11 @@ def main():
         agent_uuid = os.getenv("KEYLIME_AGENT_UUID", None)
         if agent_uuid is None:
             raise RuntimeError("Env variable KEYLIME_AGENT_UUID is empty, but agent_uuid is set to 'environment'")
+    elif not validators.valid_uuid(agent_uuid):
+        raise RuntimeError("The UUID is not valid")
+
+    if not validators.valid_agent_id(agent_uuid):
+        raise RuntimeError("The agent ID set via agent uuid parameter use invalid characters")
 
     if config.STUB_VTPM and config.TPM_CANNED_VALUES is not None:
         # Use canned values for stubbing
@@ -660,9 +706,22 @@ def main():
 
     logger.info("Agent UUID: %s", agent_uuid)
 
+    serveraddr = (config.get('cloud_agent', 'cloudagent_ip'),
+                  config.getint('cloud_agent', 'cloudagent_port'))
+
+    keylime_ca = config.get('cloud_agent', 'keylime_ca')
+    if keylime_ca == "default":
+        keylime_ca = os.path.join(config.WORK_DIR, 'cv_ca', 'cacert.crt')
+
+    server = CloudAgentHTTPServer(serveraddr, Handler, agent_uuid)
+    context = web_util.generate_mtls_context(server.mtls_cert_path, server.rsakey_path, keylime_ca, logger=logger)
+    server.socket = context.wrap_socket(server.socket, server_side=True)
+    serverthread = threading.Thread(target=server.serve_forever, daemon=True)
+
     # register it and get back a blob
+    mtls_cert = server.mtls_cert.public_bytes(serialization.Encoding.PEM)
     keyblob = registrar_client.doRegisterAgent(
-        registrar_ip, registrar_port, agent_uuid, ek_tpm, ekcert, aik_tpm, contact_ip, contact_port)
+        registrar_ip, registrar_port, agent_uuid, ek_tpm, ekcert, aik_tpm, mtls_cert, contact_ip, contact_port)
 
     if keyblob is None:
         instance_tpm.flush_keys()
@@ -683,11 +742,6 @@ def main():
         instance_tpm.flush_keys()
         raise Exception("Registration failed on activate")
 
-    serveraddr = (config.get('cloud_agent', 'cloudagent_ip'),
-                  config.getint('cloud_agent', 'cloudagent_port'))
-    server = CloudAgentHTTPServer(serveraddr, Handler, agent_uuid)
-    serverthread = threading.Thread(target=server.serve_forever, daemon=True)
-
     # Start revocation listener in a new process to not interfere with tornado
     revocation_process = multiprocessing.Process(target=revocation_listener, daemon=True)
     revocation_process.start()
@@ -703,9 +757,11 @@ def main():
         server.shutdown()
         server.server_close()
         serverthread.join()
-        logger.debug("...HTTP server stopped")
+        logger.debug("HTTP server stopped...")
         revocation_process.join()
-        logger.debug("... revocation notifier stopped")
+        logger.debug("Revocation notifier stopped...")
+        secure_mount.umount()
+        logger.debug("Umounting directories...")
         instance_tpm.flush_keys()
         logger.debug("Flushed keys successfully")
         sys.exit(0)

@@ -8,6 +8,7 @@ import ipaddress
 import threading
 import sys
 import signal
+import os
 import http.server
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
@@ -17,6 +18,7 @@ from sqlalchemy.orm.exc import NoResultFound
 from cryptography.hazmat.backends import default_backend
 from cryptography.x509 import load_der_x509_certificate
 
+from keylime.common import validators
 from keylime.db.registrar_db import RegistrarMain
 from keylime.db.keylime_db import DBEngineManager, SessionManager
 from keylime import config
@@ -74,6 +76,13 @@ class ProtectedHandler(BaseHTTPRequestHandler, SessionManager):
         agent_id = rest_params["agents"]
 
         if agent_id is not None:
+            # If the agent ID is not valid (wrong set of characters),
+            # just do nothing.
+            if not validators.valid_agent_id(agent_id):
+                web_util.echo_json_response(self, 400, "agent_id not not valid")
+                logger.error("GET received an invalid agent ID: %s", agent_id)
+                return
+
             try:
                 agent = session.query(RegistrarMain).filter_by(
                     agent_id=agent_id).first()
@@ -85,7 +94,7 @@ class ProtectedHandler(BaseHTTPRequestHandler, SessionManager):
                 logger.warning('GET returning 404 response. agent_id %s not found.', agent_id)
                 return
 
-            if not agent.active:
+            if not bool(agent.active):
                 web_util.echo_json_response(self, 404, "agent_id not yet active")
                 logger.warning('GET returning 404 response. agent_id %s not yet active.', agent_id)
                 return
@@ -94,6 +103,7 @@ class ProtectedHandler(BaseHTTPRequestHandler, SessionManager):
                 'aik_tpm': agent.aik_tpm,
                 'ek_tpm': agent.ek_tpm,
                 'ekcert': agent.ekcert,
+                'mtls_cert': agent.mtls_cert,
                 'ip': agent.ip,
                 'port': agent.port,
                 'regcount': agent.regcount,
@@ -149,6 +159,13 @@ class ProtectedHandler(BaseHTTPRequestHandler, SessionManager):
         agent_id = rest_params["agents"]
 
         if agent_id is not None:
+            # If the agent ID is not valid (wrong set of characters),
+            # just do nothing.
+            if not validators.valid_agent_id(agent_id):
+                web_util.echo_json_response(self, 400, "agent_id not not valid")
+                logger.error("DELETE received an invalid agent ID: %s", agent_id)
+                return
+
             if session.query(RegistrarMain).filter_by(agent_id=agent_id).delete():
                 # send response
                 try:
@@ -232,6 +249,13 @@ class UnprotectedHandler(BaseHTTPRequestHandler, SessionManager):
             logger.warning('POST agent returning 400 response. agent id not found in uri %s', self.path)
             return
 
+        # If the agent ID is not valid (wrong set of characters), just
+        # do nothing.
+        if not validators.valid_agent_id(agent_id):
+            web_util.echo_json_response(self, 400, "agent id not valid")
+            logger.error("POST received an invalid agent ID: %s", agent_id)
+            return
+
         try:
             content_length = int(self.headers.get('Content-Length', 0))
             if content_length == 0:
@@ -268,7 +292,7 @@ class UnprotectedHandler(BaseHTTPRequestHandler, SessionManager):
                     tpm2_objects.ek_low_tpm2b_public_from_pubkey(
                         ek509.public_key(),
                     )
-                )
+                ).decode()
 
             aik_attrs = tpm2_objects.get_tpm2b_public_object_attributes(
                 base64.b64decode(aik_tpm),
@@ -341,6 +365,11 @@ class UnprotectedHandler(BaseHTTPRequestHandler, SessionManager):
                     logger.warning(f"Contact port for agent {agent_id} is not a valid number got: {contact_port}.")
                     contact_port = None
 
+            # Check for mTLS cert
+            mtls_cert = json_body.get('mtls_cert', None)
+            if mtls_cert is None:
+                logger.warning(f"Agent {agent_id} did not sent a mTLS certificate. Most operations will not work!")
+
             # Add values to database
             d = {}
             d['agent_id'] = agent_id
@@ -348,6 +377,7 @@ class UnprotectedHandler(BaseHTTPRequestHandler, SessionManager):
             d['aik_tpm'] = aik_tpm
             d['ekcert'] = ekcert
             d['ip'] = contact_ip
+            d['mtls_cert'] = mtls_cert
             d['port'] = contact_port
             d['virtual'] = int(ekcert == 'virtual')
             d['active'] = int(False)
@@ -403,6 +433,13 @@ class UnprotectedHandler(BaseHTTPRequestHandler, SessionManager):
             logger.warning('PUT agent returning 400 response. agent id not found in uri %s', self.path)
             return
 
+        # If the agent ID is not valid (wrong set of characters), just
+        # do nothing.
+        if not validators.valid_agent_id(agent_id):
+            web_util.echo_json_response(self, 400, "agent_id not not valid")
+            logger.error("PUT received an invalid agent ID: %s", agent_id)
+            return
+
         try:
             content_length = int(self.headers.get('Content-Length', 0))
             if content_length == 0:
@@ -429,21 +466,17 @@ class UnprotectedHandler(BaseHTTPRequestHandler, SessionManager):
             if config.STUB_TPM:
                 try:
                     session.query(RegistrarMain).filter(RegistrarMain.agent_id == agent_id).update(
-                        {'active': True})
+                        {'active': int(True)})
                     session.commit()
                 except SQLAlchemyError as e:
                     logger.error('SQLAlchemy Error: %s', e)
                     raise
             else:
-                # TODO(kaifeng) Special handling should be removed
-                if engine.dialect.name == "mysql":
-                    agent.key = agent.key.encode('utf-8')
-
-                ex_mac = crypto.do_hmac(agent.key, agent_id)
+                ex_mac = crypto.do_hmac(agent.key.encode(), agent_id)
                 if ex_mac == auth_tag:
                     try:
                         session.query(RegistrarMain).filter(RegistrarMain.agent_id == agent_id).update(
-                            {'active': True})
+                            {'active': int(True)})
                         session.commit()
                     except SQLAlchemyError as e:
                         logger.error('SQLAlchemy Error: %s', e)
@@ -488,6 +521,9 @@ def start(host, tlsport, port):
     """Main method of the Registrar Server.  This method is encapsulated in a function for packaging to allow it to be
     called as a function by an external program."""
 
+    # set a conservative general umask
+    os.umask(0o077)
+
     RegistrarMain.metadata.create_all(engine, checkfirst=True)
     session = SessionManager().make_session(engine)
     try:
@@ -499,7 +535,7 @@ def start(host, tlsport, port):
 
     # Set up the protected registrar server
     protected_server = RegistrarServer((host, tlsport), ProtectedHandler)
-    context = web_util.init_mtls(section='registrar', generatedir='reg_ca', logger=logger)
+    context, _ = web_util.init_mtls(section='registrar', generatedir='reg_ca', logger=logger)
     if context is not None:
         protected_server.socket = context.wrap_socket(protected_server.socket, server_side=True)
     thread_protected_server = threading.Thread(target=protected_server.serve_forever)

@@ -27,7 +27,7 @@ To run without root privileges, be sure to export KEYLIME_TEST=True
 For Python Coverage support (pip install coverage), set env COVERAGE_FILE and:
     * coverage run --parallel-mode test_restful.py
 '''
-
+import datetime
 import sys
 import signal
 import unittest
@@ -39,10 +39,12 @@ import threading
 import shutil
 import errno
 from pathlib import Path
+from cryptography.hazmat.primitives import serialization
 
 import dbus
 
 from keylime import config
+from keylime import fs_util
 from keylime import tornado_requests
 from keylime.requests_client import RequestsClient
 from keylime import tenant
@@ -101,6 +103,7 @@ tenant_templ = None
 
 # Class-level components that are not static (so can't be added to test class)
 public_key = None
+mtls_cert = None
 keyblob = None
 ek_tpm = None
 aik_tpm = None
@@ -182,9 +185,9 @@ def setUpModule():
     tenant_templ.registrar_base_url = f'{tenant_templ.registrar_ip}:{tenant_templ.registrar_boot_port}'
     tenant_templ.registrar_base_tls_url = f'{tenant_templ.registrar_ip}:{tenant_templ.registrar_tls_boot_port}'
     tenant_templ.agent_base_url = f'{tenant_templ.cloudagent_ip}:{tenant_templ.cloudagent_port}'
+    tenant_templ.supported_version = "2.0"
     # Set up TLS
-    my_tls_cert, my_tls_priv_key = tenant_templ.get_tls_context()
-    tenant_templ.cert = (my_tls_cert, my_tls_priv_key)
+    tenant_templ.cert, tenant_templ.agent_cert = tenant_templ.get_tls_context()
 
 
 # Destroy everything on teardown
@@ -350,7 +353,7 @@ class TestRestful(unittest.TestCase):
         cls.vtpm_policy = tpm_abstract.TPM_Utilities.readPolicy(cls.vtpm_policy)
 
         # Allow targeting a specific API version (default latest)
-        cls.api_version = '1.0'
+        cls.api_version = '2.0'
 
     def setUp(self):
         """Nothing to set up before each test"""
@@ -370,8 +373,14 @@ class TestRestful(unittest.TestCase):
 
         # Change CWD for TPM-related operations
         cwd = os.getcwd()
-        config.ch_dir(config.WORK_DIR, None)
+        fs_util.ch_dir(config.WORK_DIR)
         _ = secure_mount.mount()
+
+        # Create a mTLS cert for testing
+        global mtls_cert
+        rsa_key = crypto.rsa_generate(2048)
+        valid_util = datetime.datetime.utcnow() + datetime.timedelta(days=(360 * 5))
+        mtls_cert = crypto.generate_selfsigned_cert("TEST_CERT", rsa_key, valid_util).public_bytes(serialization.Encoding.PEM)
 
         # Initialize the TPM with AIK
         (ekcert, ek_tpm, aik_tpm) = tpm_instance.tpm_init(self_activate=False,
@@ -386,13 +395,14 @@ class TestRestful(unittest.TestCase):
                 ekcert = 'emulator'
 
         # Get back to our original CWD
-        config.ch_dir(cwd, None)
+        fs_util.ch_dir(cwd)
 
         data = {
             'ekcert': ekcert,
             'aik_tpm': aik_tpm,
             'ip': contact_ip,
-            'port': contact_port
+            'port': contact_port,
+            'mtls_cert': mtls_cert
         }
         if ekcert is None or ekcert == 'emulator':
             data['ek_tpm'] = ek_tpm
@@ -477,6 +487,7 @@ class TestRestful(unittest.TestCase):
         self.assertIn("ek_tpm", json_response["results"], "Malformed response body!")
         self.assertIn("aik_tpm", json_response["results"], "Malformed response body!")
         self.assertIn("ekcert", json_response["results"], "Malformed response body!")
+        self.assertIn("mtls_cert", json_response["results"], "Malformed response body!")
         self.assertIn("ip", json_response["results"], "Malformed response body!")
         self.assertIn("port", json_response["results"], "Malformed response body!")
 
@@ -507,11 +518,11 @@ class TestRestful(unittest.TestCase):
         # We want a real cloud agent to communicate with!
         launch_cloudagent()
         time.sleep(10)
-        test_020_agent_keys_pubkey_get = RequestsClient(tenant_templ.agent_base_url, tls_enabled=False)
+        test_020_agent_keys_pubkey_get = RequestsClient(tenant_templ.agent_base_url, tls_enabled=True, ignore_hostname=True)
         response = test_020_agent_keys_pubkey_get.get(
             f'/v{self.api_version}/keys/pubkey',
-            cert="",
-            verify=False
+            cert=tenant_templ.agent_cert,
+            verify=False  # TODO: use agent certificate
         )
 
         self.assertEqual(response.status_code, 200, "Non-successful Agent pubkey return code!")
@@ -537,12 +548,13 @@ class TestRestful(unittest.TestCase):
 
         numretries = config.getint('tenant', 'max_retries')
         while numretries >= 0:
-            test_022_agent_quotes_identity_get = RequestsClient(tenant_templ.agent_base_url, tls_enabled=False)
+            test_022_agent_quotes_identity_get = RequestsClient(tenant_templ.agent_base_url,
+                                                                tls_enabled=True, ignore_hostname=True)
             response = test_022_agent_quotes_identity_get.get(
                 f'/v{self.api_version}/quotes/identity?nonce={nonce}',
                 data=None,
-                cert="",
-                verify=False
+                cert=tenant_templ.agent_cert,
+                verify=False  # TODO: use agent certificate
             )
 
             if response.status_code == 200:
@@ -611,12 +623,12 @@ class TestRestful(unittest.TestCase):
             'payload': self.payload
         }
 
-        test_024_agent_keys_ukey_post = RequestsClient(tenant_templ.agent_base_url, tls_enabled=False)
+        test_024_agent_keys_ukey_post = RequestsClient(tenant_templ.agent_base_url, tls_enabled=True, ignore_hostname=True)
         response = test_024_agent_keys_ukey_post.post(
             f'/v{self.api_version}/keys/ukey',
             data=json.dumps(data),
-            cert="",
-            verify=False
+            cert=tenant_templ.agent_cert,
+            verify=False  # TODO: use agent certificate
         )
 
         self.assertEqual(response.status_code, 200, "Non-successful Agent ukey post return code!")
@@ -700,6 +712,7 @@ class TestRestful(unittest.TestCase):
             'accept_tpm_hash_algs': config.get('tenant', 'accept_tpm_hash_algs').split(','),
             'accept_tpm_encryption_algs': config.get('tenant', 'accept_tpm_encryption_algs').split(','),
             'accept_tpm_signing_algs': config.get('tenant', 'accept_tpm_signing_algs').split(','),
+            'supported_version': tenant_templ.supported_version
         }
 
         test_030_cv_agent_post = RequestsClient(tenant_templ.verifier_base_url, tls_enabled)
@@ -795,6 +808,7 @@ class TestRestful(unittest.TestCase):
             'accept_tpm_hash_algs': config.get('tenant', 'accept_tpm_hash_algs').split(','),
             'accept_tpm_encryption_algs': config.get('tenant', 'accept_tpm_encryption_algs').split(','),
             'accept_tpm_signing_algs': config.get('tenant', 'accept_tpm_signing_algs').split(','),
+            'supported_version': tenant_templ.supported_version
         }
 
         client = RequestsClient(tenant_templ.verifier_base_url, tls_enabled)
@@ -826,11 +840,12 @@ class TestRestful(unittest.TestCase):
         if public_key is None:
             partial = "0"
 
-        test_040_agent_quotes_integrity_get = RequestsClient(tenant_templ.agent_base_url, tls_enabled=False)
+        test_040_agent_quotes_integrity_get = RequestsClient(tenant_templ.agent_base_url,
+                                                             tls_enabled=True, ignore_hostname=True)
         response = test_040_agent_quotes_integrity_get.get(
             f'/v{self.api_version}/quotes/integrity?nonce={nonce}&mask={mask}&vmask={vmask}&partial={partial}',
-            cert="",
-            verify=False
+            cert=tenant_templ.agent_cert,
+            verify=False  # TODO: use agent certificate
         )
 
         self.assertEqual(response.status_code, 200, "Non-successful Agent Integrity Get return code!")

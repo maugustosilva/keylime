@@ -9,7 +9,6 @@ import time
 
 from keylime import config
 from keylime import keylime_logging
-from keylime import registrar_client
 from keylime import crypto
 from keylime import json
 from keylime import revocation_notifier
@@ -17,7 +16,7 @@ from keylime.agentstates import AgentAttestStates
 from keylime.failure import Failure, Component
 from keylime.tpm.tpm_main import tpm
 from keylime.tpm.tpm_abstract import TPM_Utilities
-from keylime.common import algorithms
+from keylime.common import algorithms, validators
 from keylime import ima_file_signatures
 
 # setup logging
@@ -83,16 +82,6 @@ def process_quote_response(agent, json_response, agentAttestState) -> Failure:
         agent['provide_V'] = False
         received_public_key = agent['public_key']
 
-    if agent.get('registrar_data', "") == "":
-        registrar_client.init_client_tls('cloud_verifier')
-        registrar_data = registrar_client.getData(config.get("cloud_verifier", "registrar_ip"), config.get(
-            "cloud_verifier", "registrar_port"), agent['agent_id'])
-        if registrar_data is None:
-            logger.warning("AIK not found in registrar, quote not validated")
-            failure.add_event("no_aik", "AIK not found in registrar, quote not validated", False)
-            return failure
-        agent['registrar_data'] = registrar_data
-
     hash_alg = json_response.get('hash_alg')
     enc_alg = json_response.get('enc_alg')
     sign_alg = json_response.get('sign_alg')
@@ -156,14 +145,15 @@ def process_quote_response(agent, json_response, agentAttestState) -> Failure:
         agent['nonce'],
         received_public_key,
         quote,
-        agent['registrar_data']['aik_tpm'],
+        agent['ak_tpm'],
         agent['tpm_policy'],
         ima_measurement_list,
         agent['allowlist'],
         algorithms.Hash(hash_alg),
         ima_keyrings,
         mb_measurement_list,
-        agent['mb_refstate'])
+        agent['mb_refstate'],
+        compressed=(agent['supported_version'] == "1.0"))  # TODO: change this to always False after initial update
     failure.merge(quote_validation_failure)
 
     if not failure:
@@ -223,14 +213,14 @@ def prepare_get_quote(agent):
 
 
 def process_get_status(agent):
-    allowlist = ast.literal_eval(agent.allowlist)
+    allowlist = json.loads(agent.allowlist)
     if isinstance(allowlist, dict) and 'allowlist' in allowlist:
         al_len = len(allowlist['allowlist'])
     else:
         al_len = 0
 
     try :
-        mb_refstate = ast.literal_eval(agent.mb_refstate)
+        mb_refstate = json.loads(agent.mb_refstate)
     except Exception as e:
         logger.warning('Non-fatal problem ocurred while attempting to evaluate agent attribute "mb_refstate" (%s). Will just consider the value of this attribute to be "None"', e.args)
         mb_refstate = None
@@ -310,7 +300,7 @@ def validate_agent_data(agent_data):
     lists = json.loads(agent_data['allowlist'])
 
     # Validate exlude list contains valid regular expressions
-    is_valid, _, err_msg = config.valid_exclude_list(lists.get('exclude'))
+    is_valid, _, err_msg = validators.valid_exclude_list(lists.get('exclude'))
     if not is_valid:
         err_msg += " Exclude list regex is misformatted. Please correct the issue and try again."
 

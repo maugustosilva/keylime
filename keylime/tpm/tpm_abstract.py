@@ -108,7 +108,7 @@ class AbstractTPM(metaclass=ABCMeta):
         pass
 
     @abstractmethod
-    def get_tpm_manufacturer(self):
+    def get_tpm_manufacturer(self, output=None):
         pass
 
     @abstractmethod
@@ -133,10 +133,9 @@ class AbstractTPM(metaclass=ABCMeta):
             return {}
 
     def __write_tpm_data(self):
-        os.umask(0o077)
         if os.geteuid() != 0 and config.REQUIRE_ROOT:
             logger.warning("Creating tpm metadata file without root. Sensitive trust roots may be at risk!")
-        with open('tpmdata.yml', 'w', encoding="utf-8") as f:
+        with os.fdopen(os.open("tpmdata.yml", os.O_WRONLY | os.O_CREAT, 0o600), "w", encoding="utf-8") as f:
             yaml.dump(self.global_tpmdata, f, Dumper=SafeDumper)
 
     def get_tpm_metadata(self, key):
@@ -158,11 +157,11 @@ class AbstractTPM(metaclass=ABCMeta):
 
     # tpm_quote
     @abstractmethod
-    def create_quote(self, nonce, data=None, pcrmask=EMPTYMASK, hash_alg=None):
+    def create_quote(self, nonce, data=None, pcrmask=EMPTYMASK, hash_alg=None, compress=False):
         pass
 
     @abstractmethod
-    def check_quote(self, agentAttestState, nonce, data, quote, aikTpmFromRegistrar, tpm_policy={}, ima_measurement_list=None, allowlist={}, hash_alg=None, ima_keyrings=None, mb_measurement_list=None, mb_refstate=None):
+    def check_quote(self, agentAttestState, nonce, data, quote, aikTpmFromRegistrar, tpm_policy={}, ima_measurement_list=None, allowlist={}, hash_alg=None, ima_keyrings=None, mb_measurement_list=None, mb_refstate=None, compressed=False):
         pass
 
     def START_HASH(self, algorithm=None):
