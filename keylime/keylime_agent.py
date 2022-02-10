@@ -30,6 +30,7 @@ import subprocess
 import psutil
 
 from cryptography import x509
+from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import serialization
 
 from keylime import config
@@ -399,18 +400,24 @@ class CloudAgentHTTPServer(ThreadingMixIn, HTTPServer):
 
     def __init__(self, server_address, RequestHandlerClass, agent_uuid):
         """Constructor overridden to provide ability to pass configuration arguments to the server"""
+        # Find the locations for the U/V transport and mTLS key and certificate.
+        # They are either relative to secdir (/var/lib/keylime/secure) or absolute paths.
         secdir = secure_mount.mount()
-        keyname = os.path.join(secdir,
-                               config.get('cloud_agent', 'rsa_keyname'))
-        certname = os.path.join(secdir, config.get('cloud_agent', 'mtls_cert'))
+        keyname = config.get('cloud_agent', 'rsa_keyname')
+        if not os.path.isabs(keyname):
+            keyname = os.path.join(secdir, keyname)
+        certname = config.get('cloud_agent', 'mtls_cert')
+        if not os.path.isabs(certname):
+            certname = os.path.join(secdir, certname)
+
         # read or generate the key depending on configuration
         if os.path.isfile(keyname):
             # read in private key
-            logger.debug("Using existing key in %s", keyname)
+            logger.info("Using existing key in %s", keyname)
             f = open(keyname, "rb")
             rsa_key = crypto.rsa_import_privkey(f.read())
         else:
-            logger.debug("key not found, generating a new one")
+            logger.info("Key for U/V transport and mTLS certificate not found, generating a new one")
             rsa_key = crypto.rsa_generate(2048)
             with open(keyname, "wb") as f:
                 f.write(crypto.rsa_export_privkey(rsa_key))
@@ -421,11 +428,11 @@ class CloudAgentHTTPServer(ThreadingMixIn, HTTPServer):
             self.rsaprivatekey)
 
         if os.path.isfile(certname):
-            logger.debug("Using existing mTLS cert in %s", certname)
+            logger.info("Using existing mTLS cert in %s", certname)
             with open(certname, "rb") as f:
-                mtls_cert = x509.load_pem_x509_certificate(f.read())
+                mtls_cert = x509.load_pem_x509_certificate(f.read(), backend=default_backend())
         else:
-            logger.debug("No mTLS certificate found generating a new one")
+            logger.info("No mTLS certificate found, generating a new one")
             with open(certname, "wb") as f:
                 # By default generate a TLS certificate valid for 5 years
                 valid_util = datetime.datetime.utcnow() + datetime.timedelta(days=(360 * 5))
