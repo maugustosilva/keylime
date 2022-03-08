@@ -2,13 +2,15 @@
 SPDX-License-Identifier: Apache-2.0
 Copyright 2017 Massachusetts Institute of Technology.
 '''
-
+import signal
 from multiprocessing import Process
 import threading
 import functools
 import time
 import os
 import sys
+
+from typing import Optional
 
 import requests
 import zmq
@@ -22,13 +24,16 @@ from keylime.common import retry
 
 
 logger = keylime_logging.init_logging('revocation_notifier')
-broker_proc = None
+broker_proc: Optional[Process] = None
 
 _SOCKET_PATH = "/var/run/keylime/keylime.verifier.ipc"
 
 
 def start_broker():
     def worker():
+        # do not receive signals form the parent process
+        os.setpgrp()
+        signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
         dir_name = os.path.dirname(_SOCKET_PATH)
         if not os.path.exists(dir_name):
             os.makedirs(dir_name, 0o700)
@@ -56,7 +61,7 @@ def start_broker():
             context.destroy()
 
     global broker_proc
-    broker_proc = Process(target=worker)
+    broker_proc = Process(target=worker, name="zeroMQ")
     broker_proc.start()
 
 
@@ -68,10 +73,19 @@ def stop_broker():
             os.remove(f"ipc://{_SOCKET_PATH}")
         logger.info("Stopping revocation notifier...")
         broker_proc.terminate()
-        broker_proc.join()
+        broker_proc.join(5)
+        if broker_proc.is_alive():
+            logger.debug("Killing revocation notifier because it did not terminate after 5 seconds...")
+            broker_proc.kill()
 
 
 def notify(tosend):
+    # python-requests internally uses either simplejson (preferred) or
+    # the built-in json module, and when it is using the built-in one,
+    # it may encounter difficulties handling bytes instead of strings.
+    # To avoid such issues, let's convert `tosend' to str beforehand.
+    tosend = json.bytes_to_str(tosend)
+
     def worker(tosend):
         context = zmq.Context()
         mysock = context.socket(zmq.PUB)
@@ -104,6 +118,10 @@ def notify_webhook(tosend):
     if url == '':
         return
 
+    # Similarly to notify(), let's convert `tosend' to str to prevent
+    # possible issues with json handling by python-requests.
+    tosend = json.bytes_to_str(tosend)
+
     def worker_webhook(tosend, url):
         interval = config.getfloat('cloud_verifier', 'retry_interval')
         exponential_backoff = config.getboolean('cloud_verifier', 'exponential_backoff')
@@ -112,7 +130,7 @@ def notify_webhook(tosend):
         for i in range(config.getint('cloud_verifier', 'max_retries')):
             next_retry = retry.retry_time(exponential_backoff, interval, i, logger)
             try:
-                response = session.post(url, json=tosend)
+                response = session.post(url, json=tosend, timeout=5)
                 if response.status_code in [200, 202]:
                     break
 
@@ -126,7 +144,7 @@ def notify_webhook(tosend):
             time.sleep(next_retry)
 
     w = functools.partial(worker_webhook, tosend, url)
-    t = threading.Thread(target=w)
+    t = threading.Thread(target=w, daemon=True)
     t.start()
 
 
