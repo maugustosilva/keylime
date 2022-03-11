@@ -71,7 +71,7 @@ class IMAMeasurementList:
         return best
 
 
-def read_measurement_list(filename, nth_entry):
+def read_measurement_list(ima_log_file, nth_entry):
     """ Read the IMA measurement list starting from a given entry.
         The entry may be of any value 0 <= entry <= entries_in_log where
         entries_in_log + 1 indicates that the client wants to read the next entry
@@ -86,14 +86,13 @@ def read_measurement_list(filename, nth_entry):
     # Try to find the closest entry to the nth_entry
     num_entries, filesize = IMAML.find(nth_entry)
 
-    if not os.path.exists(filename):
+    if not ima_log_file:
         IMAML.reset()
         nth_entry = 0
-        logger.warning("IMA measurement list not available: %s", filename)
+        logger.warning("IMA measurement list not available: %s", config.IMA_ML)
     else:
-        with open(filename, 'r', encoding="utf-8") as f:
-            f.seek(filesize)
-            filedata = f.read()
+        ima_log_file.seek(filesize)
+        filedata = ima_log_file.read()
         # filedata now corresponds to starting list at entry number 'IMAML.num_entries'
         # find n-th entry and determine number of total entries in file now
         offset = 0
@@ -112,7 +111,7 @@ def read_measurement_list(filename, nth_entry):
         # Nothing found? User request beyond next-expected entry.
         # Start over with entry 0. This cannot recurse again.
         if ml is None:
-            return read_measurement_list(filename, 0)
+            return read_measurement_list(ima_log_file, 0)
 
     return ml, nth_entry, num_entries
 
@@ -126,20 +125,20 @@ def _validate_ima_ng(exclude_regex, allowlist, digest: ima_ast.Digest, path: ima
     failure = Failure(Component.IMA, ["validation", "ima-ng"])
     if allowlist is not None:
         if exclude_regex is not None and exclude_regex.match(path.name):
-            logger.debug("IMA: ignoring excluded path %s" % path)
+            logger.debug("IMA: ignoring excluded path %s", path)
             return failure
 
         accept_list = allowlist[hash_types].get(path.name, None)
         if accept_list is None:
-            logger.warning(f"File not found in allowlist: {path.name}")
+            logger.warning("File not found in allowlist: %s", path.name)
             failure.add_event("not_in_allowlist", f"File not found in allowlist: {path.name}", True)
             return failure
 
         if codecs.encode(digest.hash, 'hex').decode('utf-8') not in accept_list:
-            logger.warning("Hashes for file %s don't match %s not in %s" %
-                           (path.name,
-                            codecs.encode(digest.hash, 'hex').decode('utf-8'),
-                            accept_list))
+            logger.warning("Hashes for file %s don't match %s not in %s",
+                           path.name,
+                           codecs.encode(digest.hash, 'hex').decode('utf-8'),
+                           accept_list)
             failure.add_event(
                 "allowlist_hash",
                 {"message": "Hash not in allowlist found",
@@ -157,16 +156,16 @@ def _validate_ima_sig(exclude_regex, ima_keyrings, allowlist, digest: ima_ast.Di
     if ima_keyrings and signature:
 
         if exclude_regex is not None and exclude_regex.match(path.name):
-            logger.debug(f"IMA: ignoring excluded path {path.name}")
+            logger.debug("IMA: ignoring excluded path %s", path.name)
             return failure
 
         if not ima_keyrings.integrity_digsig_verify(signature.data, digest.hash, digest.algorithm):
-            logger.warning(f"signature for file {path.name} is not valid")
+            logger.warning("signature for file %s is not valid", path.name)
             failure.add_event("invalid_signature", f"signature for file {path.name} is not valid", True)
             return failure
 
         valid_signature = True
-        logger.debug("signature for file %s is good" % path)
+        logger.debug("signature for file %s is good", path)
 
     # If there is also an allowlist verify the file against that but only do this if:
     # - we did not evaluate the signature (valid_siganture = False)
@@ -282,7 +281,7 @@ def _process_measurement_list(agentAttestState, lines, hash_alg, lists=None, m2w
                 # End of list should equal pcr value
                 found_pcr = (running_hash == pcrval_bytes)
                 if found_pcr:
-                    logger.debug('Found match at linenum %s' % (linenum + 1))
+                    logger.debug('Found match at linenum %s', linenum + 1)
                     # We always want to have the very last line for the attestation, so
                     # we keep the previous runninghash, which is not the last one!
                     agentAttestState.update_ima_attestation(int(entry.pcr), running_hash, linenum + 1)
@@ -294,18 +293,18 @@ def _process_measurement_list(agentAttestState, lines, hash_alg, lists=None, m2w
                 m2w.write(f"{hash_value} {path}\n")
         except ima_ast.ParserError:
             failure.add_event("entry", f"Line was not parsable into a valid IMA entry: {line}", True, ["parser"])
-            logger.error(f"Line was not parsable into a valid IMA entry: {line}")
+            logger.error("Line was not parsable into a valid IMA entry: %s", line)
 
     # check PCR value has been found
     if not found_pcr:
-        logger.error(f"IMA measurement list does not match TPM PCR {pcrval}")
+        logger.error("IMA measurement list does not match TPM PCR %s", pcrval)
         failure.add_event("pcr_mismatch", f"IMA measurement list does not match TPM PCR {pcrval}", True)
 
     # Check if any validators failed
     if sum(errors.values()) > 0:
         error_msg = "IMA ERRORS: Some entries couldn't be validated. Number of failures in modes: "
         error_msg += ", ".join([f'{k.__name__ } {v}' for k, v in errors.items()])
-        logger.error(error_msg + ".")
+        logger.error("%s.", error_msg)
 
     return codecs.encode(running_hash, 'hex').decode('utf-8'), failure
 
@@ -496,8 +495,8 @@ def read_excllist(exclude_path=None):
                     continue
                 excl_list.append(line)
 
-        logger.debug("Loaded exclusion list from %s: %s" %
-                     (exclude_path, excl_list))
+        logger.debug("Loaded exclusion list from %s: %s",
+                     exclude_path, excl_list)
 
     return excl_list
 

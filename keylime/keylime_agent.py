@@ -43,6 +43,7 @@ from keylime import json
 from keylime import revocation_notifier
 from keylime import registrar_client
 from keylime import secure_mount
+from keylime import user_utils
 from keylime import web_util
 from keylime import api_version as keylime_api_version
 from keylime.common import algorithms, validators
@@ -181,7 +182,7 @@ class Handler(BaseHTTPRequestHandler):
                 ima_ml_entry = int(ima_ml_entry)
                 if ima_ml_entry > self.server.next_ima_ml_entry:
                     ima_ml_entry = 0
-                ml, nth_entry, num_entries = ima.read_measurement_list(config.IMA_ML, ima_ml_entry)
+                ml, nth_entry, num_entries = ima.read_measurement_list(self.server.ima_log_file, ima_ml_entry)
                 if num_entries > 0:
                     response['ima_measurement_list'] = ml
                     response['ima_measurement_list_entry'] = nth_entry
@@ -192,12 +193,10 @@ class Handler(BaseHTTPRequestHandler):
             # generally speaking, retrieving the 15Kbytes of a boot log does not seem significant compared to the
             # potential Mbytes of an IMA measurement list.
             if TPM_Utilities.check_mask(imaMask, config.MEASUREDBOOT_PCRS[0]):
-                if not os.path.exists(config.MEASUREDBOOT_ML):
-                    logger.warning("TPM2 event log not available: %s", config.MEASUREDBOOT_ML)
+                if not self.server.tpm_log_file_data:
+                    logger.warning(f"TPM2 event log not available: {config.MEASUREDBOOT_ML}")
                 else:
-                    with open(config.MEASUREDBOOT_ML, 'rb') as f:
-                        el = base64.b64encode(f.read())
-                    response['mb_measurement_list'] = el
+                    response['mb_measurement_list'] = self.server.tpm_log_file_data
 
             web_util.echo_json_response(self, 200, "Success", response)
             logger.info('GET %s quote returning 200 response.', rest_params["quotes"])
@@ -398,7 +397,7 @@ class CloudAgentHTTPServer(ThreadingMixIn, HTTPServer):
     next_ima_ml_entry = 0 # The next IMA log offset the verifier may ask for.
     boottime = int(psutil.boot_time())
 
-    def __init__(self, server_address, RequestHandlerClass, agent_uuid, contact_ip):
+    def __init__(self, server_address, RequestHandlerClass, agent_uuid, contact_ip, ima_log_file, tpm_log_file_data):
         """Constructor overridden to provide ability to pass configuration arguments to the server"""
         # Find the locations for the U/V transport and mTLS key and certificate.
         # They are either relative to secdir (/var/lib/keylime/secure) or absolute paths.
@@ -454,6 +453,8 @@ class CloudAgentHTTPServer(ThreadingMixIn, HTTPServer):
             self, server_address, RequestHandlerClass)
         self.enc_keyname = config.get('cloud_agent', 'enc_keyname')
         self.agent_uuid = agent_uuid
+        self.ima_log_file = ima_log_file
+        self.tpm_log_file_data = tpm_log_file_data
 
     def add_U(self, u):
         """Threadsafe method for adding a U value received from the Tenant
@@ -617,6 +618,15 @@ def main():
         if not os.access(ML, os.F_OK):
             logger.warning("Measurement list path %s not accessible by agent. Any attempt to instruct it to access this path - via \"keylime_tenant\" CLI - will result in agent process dying", ML)
 
+    ima_log_file = None
+    if os.path.exists(config.IMA_ML):
+        ima_log_file = open(config.IMA_ML, 'r', encoding="utf-8")
+
+    tpm_log_file_data = None
+    if os.path.exists(config.MEASUREDBOOT_ML):
+        with open(config.MEASUREDBOOT_ML, 'rb') as tpm_log_file:
+            tpm_log_file_data = base64.b64encode(tpm_log_file.read())
+
     if config.get('cloud_agent', 'agent_uuid') == 'dmidecode':
         if os.getuid() != 0:
             raise RuntimeError('agent_uuid is configured to use dmidecode, '
@@ -626,6 +636,20 @@ def main():
         if ret['code'] != 0:
             raise RuntimeError('agent_uuid is configured to use dmidecode, '
                                'but it\'s is not found on the system.')
+
+    # initialize the tmpfs partition to store keys if it isn't already available
+    secdir = secure_mount.mount()
+
+    # Now that operations requiring root privileges are done, drop privileges
+    # if 'run_as' is available in the configuration.
+    if os.getuid() == 0:
+        run_as = config.get('cloud_agent', 'run_as', fallback='')
+        if run_as != '':
+            user_utils.chown(secdir, run_as)
+            user_utils.change_uidgid(run_as)
+            logger.info(f"Dropped privileges to {run_as}")
+        else:
+            logger.warning("Cannot drop privileges since 'run_as' is empty or missing in keylime.conf agent section.")
 
     # Instanitate TPM class
 
@@ -641,9 +665,6 @@ def main():
     contact_port = os.getenv("KEYLIME_AGENT_CONTACT_PORT", None)
     if contact_port is None and config.has_option('cloud_agent', 'agent_contact_port'):
         contact_port = config.get('cloud_agent', 'agent_contact_port', fallback="invalid")
-
-    # initialize the tmpfs partition to store keys if it isn't already available
-    secure_mount.mount()
 
     # change dir to working dir
     fs_util.ch_dir(config.WORK_DIR)
@@ -723,7 +744,7 @@ def main():
     if keylime_ca == "default":
         keylime_ca = os.path.join(config.WORK_DIR, 'cv_ca', 'cacert.crt')
 
-    server = CloudAgentHTTPServer(serveraddr, Handler, agent_uuid, contact_ip)
+    server = CloudAgentHTTPServer(serveraddr, Handler, agent_uuid, contact_ip, ima_log_file, tpm_log_file_data)
     context = web_util.generate_mtls_context(server.mtls_cert_path, server.rsakey_path, keylime_ca, logger=logger)
     server.socket = context.wrap_socket(server.socket, server_side=True)
     serverthread = threading.Thread(target=server.serve_forever, daemon=True)
