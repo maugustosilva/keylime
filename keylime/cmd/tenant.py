@@ -1,24 +1,20 @@
-#!/usr/bin/python3
+import sys
 
-'''
-SPDX-License-Identifier: Apache-2.0
-Copyright 2017 Massachusetts Institute of Technology.
-'''
+from keylime import keylime_logging, tenant
 
-from keylime import keylime_logging
-from keylime import tenant
-
-logger = keylime_logging.init_logging('tenant')
+logger = keylime_logging.init_logging("tenant")
 
 
-def main():
-    tenant.main()
+def main() -> None:
+    try:
+        tenant.main()
+    except tenant.UserError as ue:
+        logger.error(str(ue))
+        sys.exit(1)
+    except Exception as e:
+        logger.exception(e)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except tenant.UserError as ue:
-        logger.error(str(ue))
-    except Exception as e:
-        logger.exception(e)
+    main()

@@ -1,9 +1,8 @@
-"""
-SPDX-License-Identifier: Apache-2.0
-Copyright 2021 Angelo Ruocco - IBM Research Lab Zurich
-"""
+from logging import Logger
+from typing import Optional
 
-def retry_time(exponential, base, ntries, logger):
+
+def retry_time(exponential: bool, base: float, ntries: int, logger: Optional[Logger]) -> float:
     if exponential:
         if base > 1:
             return base**ntries

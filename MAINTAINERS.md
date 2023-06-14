@@ -1,14 +1,11 @@
 Project Lead:
-@mpeters
+@maugustosilva
 
 Maintainers:
 
-@ashcrow
-@axelsimon
-@font
-@lukehinds
-@jetwhiz
-@kaifeng
-@maugustosilva
-@nabilschear
+@mpeters
 @THS-on
+@stefanberger
+@ansasaki
+@aplanas
+@sergio-correia

@@ -1,28 +1,24 @@
-"""
-SPDX-License-Identifier: Apache-2.0
-Copyright 2021 Red Hat, Inc.
-"""
-
 import hashlib
 import struct
-from typing import Union, Tuple
+from typing import Any, Dict, Tuple, Union, cast
 
+import cryptography.hazmat.primitives.asymmetric.ec as crypto_ec
 from cryptography.hazmat.backends import default_backend
-from cryptography.hazmat.primitives.asymmetric.rsa import (
-    RSAPublicKey,
-    RSAPublicNumbers,
-)
+from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric.ec import (
-    EllipticCurvePublicKey,
     EllipticCurve,
+    EllipticCurvePublicKey,
     EllipticCurvePublicNumbers,
 )
-import cryptography.hazmat.primitives.asymmetric.ec as crypto_ec
+from cryptography.hazmat.primitives.asymmetric.rsa import RSAPublicKey, RSAPublicNumbers
+from cryptography.hazmat.primitives.ciphers import algorithms
+
+from keylime.tpm.types import TpmsAttestType
 
 pubkey_type = Union[RSAPublicKey, EllipticCurvePublicKey]
 
 
-def _pack_in_tpm2b(val):
+def _pack_in_tpm2b(val: bytes) -> bytes:
     return struct.pack(">H", len(val)) + val
 
 
@@ -46,6 +42,13 @@ TPM_ALG_SHA512 = 0x000D
 TPM_ALG_AES = 0x0006
 TPM_ALG_CFB = 0x0043
 
+TPM_ALG_RSASSA = 0x0014
+
+TPM_ALG_ECDSA = 0x0018
+
+TPM_GENERATED_VALUE = 0xFF544347
+
+TPM_ST_ATTEST_QUOTE = 0x8018
 
 # These are the object attribute values important for EK certs
 OA_FIXEDTPM = 0x00000002
@@ -64,24 +67,40 @@ OA_SIGN_ENCRYPT = 0x00040000
 # These are some common object attribute values
 # Source for AK_EXPECTED_ATTRS: tpm2-tools, tpm2_createak.c, set_key_algorithm
 AK_EXPECTED_ATTRS = (
-    OA_RESTRICTED
-    | OA_USERWITHAUTH
-    | OA_SIGN_ENCRYPT
-    | OA_FIXEDTPM
-    | OA_FIXEDPARENT
-    | OA_SENSITIVEDATAORIGIN
+    OA_RESTRICTED | OA_USERWITHAUTH | OA_SIGN_ENCRYPT | OA_FIXEDTPM | OA_FIXEDPARENT | OA_SENSITIVEDATAORIGIN
 )
 
 
-class NonAsymAlgSpecificParameters():
-    sym_algorithm = None
-    sym_keybits = None
-    sym_mode = None
-    sym_details = None
-    scheme_scheme = None
-    scheme_details = None
+# The hash functions used by TPM
+HASH_FUNCS: Dict[int, hashes.HashAlgorithm] = {
+    TPM_ALG_SHA1: hashes.SHA1(),
+    TPM_ALG_SHA256: hashes.SHA256(),
+    TPM_ALG_SHA384: hashes.SHA384(),
+    TPM_ALG_SHA512: hashes.SHA512(),
+}
 
-    def __init__(self, sym_algorithm, sym_keybits, sym_mode, sym_details, scheme_scheme, scheme_details):
+SYMCIPHER_FUNCS = {
+    TPM_ALG_AES: algorithms.AES,
+}
+
+
+class NonAsymAlgSpecificParameters:
+    sym_algorithm: int
+    sym_keybits: int
+    sym_mode: int
+    sym_details: int
+    scheme_scheme: int
+    scheme_details: int
+
+    def __init__(
+        self,
+        sym_algorithm: int,
+        sym_keybits: int,
+        sym_mode: int,
+        sym_details: int,
+        scheme_scheme: int,
+        scheme_details: int,
+    ) -> None:
         self.sym_algorithm = sym_algorithm
         self.sym_keybits = sym_keybits
         self.sym_mode = sym_mode
@@ -89,17 +108,9 @@ class NonAsymAlgSpecificParameters():
         self.scheme_scheme = scheme_scheme
         self.scheme_details = scheme_details
 
-    def to_bytes(self):
-        sym = struct.pack(
-            ">HHH",
-            self.sym_algorithm,
-            self.sym_keybits,
-            self.sym_mode
-        )
-        scheme = struct.pack(
-            ">H",
-            self.scheme_scheme
-        )
+    def to_bytes(self) -> bytes:
+        sym = struct.pack(">HHH", self.sym_algorithm, self.sym_keybits, self.sym_mode)
+        scheme = struct.pack(">H", self.scheme_scheme)
         return sym + scheme
 
 
@@ -108,50 +119,107 @@ class NonAsymAlgSpecificParameters():
 EK_LOW_NAMEALG = TPM_ALG_SHA256
 EK_HIGH_SHA256_NAMEALG = EK_LOW_NAMEALG
 EK_LOW_ATTRIBUTES = (
-    OA_FIXEDTPM |
+    OA_FIXEDTPM
+    |
     # ~OA_STCLEAR |
-    OA_FIXEDPARENT |
-    OA_SENSITIVEDATAORIGIN |
+    OA_FIXEDPARENT
+    | OA_SENSITIVEDATAORIGIN
+    |
     # ~OA_USERWITHAUTH |
-    OA_ADMINWITHPOLICY |
+    OA_ADMINWITHPOLICY
+    |
     # ~OA_NODA |
     # ~OA_ENCRYPTEDDUPLICATION |
-    OA_RESTRICTED |
-    OA_DECRYPT
+    OA_RESTRICTED
+    | OA_DECRYPT
     # ~OA_SIGN_ENCRYPT,
 )
 EK_HIGH_ATTRIBUTES = (
-    OA_FIXEDTPM |
+    OA_FIXEDTPM
+    |
     # ~OA_STCLEAR |
-    OA_FIXEDPARENT |
-    OA_SENSITIVEDATAORIGIN |
-    OA_USERWITHAUTH |
-    OA_ADMINWITHPOLICY |
+    OA_FIXEDPARENT
+    | OA_SENSITIVEDATAORIGIN
+    | OA_USERWITHAUTH
+    | OA_ADMINWITHPOLICY
+    |
     # ~OA_NODA |
     # ~OA_ENCRYPTEDDUPLICATION |
-    OA_RESTRICTED |
-    OA_DECRYPT
+    OA_RESTRICTED
+    | OA_DECRYPT
     # ~OA_SIGN_ENCRYPT,
 )
 # TPM2_PolicySecret(TPM_RH_ENDORSEMENT)
 EK_LOW_AUTH_POLICY = bytes(
     [
-        0x83, 0x71, 0x97, 0x67, 0x44, 0x84,
-        0xB3, 0xF8, 0x1A, 0x90, 0xCC, 0x8D,
-        0x46, 0xA5, 0xD7, 0x24, 0xFD, 0x52,
-        0xD7, 0x6E, 0x06, 0x52, 0x0B, 0x64,
-        0xF2, 0xA1, 0xDA, 0x1B, 0x33, 0x14,
-        0x69, 0xAA,
+        0x83,
+        0x71,
+        0x97,
+        0x67,
+        0x44,
+        0x84,
+        0xB3,
+        0xF8,
+        0x1A,
+        0x90,
+        0xCC,
+        0x8D,
+        0x46,
+        0xA5,
+        0xD7,
+        0x24,
+        0xFD,
+        0x52,
+        0xD7,
+        0x6E,
+        0x06,
+        0x52,
+        0x0B,
+        0x64,
+        0xF2,
+        0xA1,
+        0xDA,
+        0x1B,
+        0x33,
+        0x14,
+        0x69,
+        0xAA,
     ]
 )
 EK_HIGH_SHA256_AUTH_POLICY = bytes(
     [
-        0xCA, 0x3D, 0x0A, 0x99, 0xA2, 0xB9,
-        0x39, 0x06, 0xF7, 0xA3, 0x34, 0x24,
-        0x14, 0xEF, 0xCF, 0xB3, 0xA3, 0x85,
-        0xD4, 0x4C, 0xD1, 0xFD, 0x45, 0x90,
-        0x89, 0xD1, 0x9B, 0x50, 0x71, 0xC0,
-        0xB7, 0xA0,
+        0xCA,
+        0x3D,
+        0x0A,
+        0x99,
+        0xA2,
+        0xB9,
+        0x39,
+        0x06,
+        0xF7,
+        0xA3,
+        0x34,
+        0x24,
+        0x14,
+        0xEF,
+        0xCF,
+        0xB3,
+        0xA3,
+        0x85,
+        0xD4,
+        0x4C,
+        0xD1,
+        0xFD,
+        0x45,
+        0x90,
+        0x89,
+        0xD1,
+        0x9B,
+        0x50,
+        0x71,
+        0xC0,
+        0xB7,
+        0xA0,
     ]
 )
 EK_LOW_NON_ASYM_ALG_PARMS = NonAsymAlgSpecificParameters(
@@ -177,7 +245,7 @@ def _curve_id_from_name(name: str) -> int:
     if name == "secp521r1":
         return TPM_ECC_NIST_P521
 
-    raise ValueError("Invalid curve name %s requested" % name)
+    raise ValueError(f"Invalid curve name {name} requested")
 
 
 def _curve_from_curve_id(cid: int) -> EllipticCurve:
@@ -192,7 +260,7 @@ def _curve_from_curve_id(cid: int) -> EllipticCurve:
     if cid == TPM_ECC_NIST_P521:
         return crypto_ec.SECP521R1()
 
-    raise ValueError("Invalid curve id %d requested" % cid)
+    raise ValueError(f"Invalid curve id {cid} requested")
 
 
 def _extract_tpm2b(vals: bytes) -> Tuple[bytes, bytes]:
@@ -203,21 +271,23 @@ def _extract_tpm2b(vals: bytes) -> Tuple[bytes, bytes]:
     return (vals[:length], vals[length:])
 
 
-def pubkey_from_tpm2b_public(public: bytes) -> pubkey_type:
+def pubkey_parms_from_tpm2b_public(
+    public: bytes,
+) -> Tuple[pubkey_type, int]:
     (public, rest) = _extract_tpm2b(public)
     if len(rest) != 0:
         raise ValueError("More in tpm2b_public than tpmt_public")
-    # Extract type, [nameAlg], and [objectAttributes] (we don't care about the
-    #  latter two)
-    (alg_type, _, _) = struct.unpack(">HHI", public[0:8])
+    # Extract type, nameAlg, and [objectAttributes] (we don't care about the
+    #  latter)
+    (alg_type, name_alg, _) = struct.unpack(">HHI", public[0:8])
     # Ignore the authPolicy
     (_, sym_parms) = _extract_tpm2b(public[8:])
     # Ignore the non-asym-alg parameters
-    (sym_mode,) = struct.unpack(">H", sym_parms[0:2])
+    (sym_alg,) = struct.unpack(">H", sym_parms[0:2])
     # Ignore the sym_mode and keybits (4 bytes), possibly symmetric (2) and sign
     #  scheme (2)
     to_skip = 4 + 2  # sym_mode, keybits and sign scheme
-    if sym_mode != TPM2_ALG_NULL:
+    if sym_alg != TPM2_ALG_NULL:
         to_skip = to_skip + 2
     asym_parms = sym_parms[to_skip:]
 
@@ -228,19 +298,16 @@ def pubkey_from_tpm2b_public(public: bytes) -> pubkey_type:
             exponent = 65537
         (modulus, _) = _extract_tpm2b(asym_parms[6:])
         if (len(modulus) * 8) != keybits:
-            raise ValueError(
-                "Misparsed either modulus or keybits: %d*8 != %d"
-                % (len(modulus), keybits)
-            )
+            raise ValueError(f"Misparsed either modulus or keybits: {len(modulus)}*8 != {keybits}")
         bmodulus = int.from_bytes(modulus, byteorder="big")
 
-        numbers = RSAPublicNumbers(exponent, bmodulus)
-        return numbers.public_key(backend=default_backend())
+        rsa_numbers = RSAPublicNumbers(exponent, bmodulus)
+        return rsa_numbers.public_key(backend=default_backend()), name_alg
 
     if alg_type == TPM_ALG_ECC:
-        (curve, _) = struct.unpack(">HH", asym_parms[0:4])
+        (curve_id, _) = struct.unpack(">HH", asym_parms[0:4])
         asym_x = asym_parms[4:]
-        curve = _curve_from_curve_id(curve)
+        curve = _curve_from_curve_id(curve_id)
 
         (x, asym_y) = _extract_tpm2b(asym_x)
         (y, rest) = _extract_tpm2b(asym_y)
@@ -248,37 +315,37 @@ def pubkey_from_tpm2b_public(public: bytes) -> pubkey_type:
             raise ValueError("Misparsed: more contents after X and Y")
 
         if (len(x) * 8) != curve.key_size:
-            raise ValueError(
-                "Misparsed either X or curve: %d*8 != %d" % (
-                    len(x), curve.key_size)
-            )
+            raise ValueError(f"Misparsed either X or curve: {len(x)}*8 != {curve.key_size}")
         if (len(y) * 8) != curve.key_size:
-            raise ValueError(
-                "Misparsed either Y or curve curve: %d*8 != %d"
-                % (len(y), curve.key_size)
-            )
+            raise ValueError(f"Misparsed either Y or curve curve: {len(y)}*8 != {curve.key_size}")
 
         bx = int.from_bytes(x, byteorder="big")
         by = int.from_bytes(y, byteorder="big")
 
-        numbers = EllipticCurvePublicNumbers(bx, by, curve)
-        return numbers.public_key(backend=default_backend())
+        ecc_numbers = EllipticCurvePublicNumbers(bx, by, curve)
+        return ecc_numbers.public_key(backend=default_backend()), name_alg
 
-    raise ValueError("Invalid tpm2b_public type: %d" % alg_type)
+    raise ValueError(f"Invalid tpm2b_public type: {alg_type}")
 
 
-def tpm2b_public_from_pubkey(pubkey: pubkey_type, name_alg: int, attributes: int, auth_policy: bytes, parms: NonAsymAlgSpecificParameters) -> bytes:
+def pubkey_from_tpm2b_public(public: bytes) -> pubkey_type:
+    pubkey, _ = pubkey_parms_from_tpm2b_public(public)
+    return pubkey
+
+
+def tpm2b_public_from_pubkey(
+    pubkey: pubkey_type, name_alg: int, attributes: int, auth_policy: bytes, parms: NonAsymAlgSpecificParameters
+) -> bytes:
     """
     Returns a reconstructed TPM2B_PUBLIC from a public key.
     """
     if isinstance(pubkey, RSAPublicKey):
         alg_type = TPM_ALG_RSA
 
-        numbers = pubkey.public_numbers()
-        n = numbers.n.to_bytes((numbers.n.bit_length() + 7) // 8,
-                               byteorder="big")
+        rsa_numbers = pubkey.public_numbers()
+        n = rsa_numbers.n.to_bytes((rsa_numbers.n.bit_length() + 7) // 8, byteorder="big")
 
-        pub_e = numbers.e
+        pub_e = rsa_numbers.e
         if pub_e == 65537:
             pub_e = 0
 
@@ -287,19 +354,15 @@ def tpm2b_public_from_pubkey(pubkey: pubkey_type, name_alg: int, attributes: int
     elif isinstance(pubkey, EllipticCurvePublicKey):
         alg_type = TPM_ALG_ECC
 
-        numbers = pubkey.public_numbers()
+        ecc_numbers = pubkey.public_numbers()
 
         algo_parms = struct.pack(
             ">HH",
-            _curve_id_from_name(numbers.curve.name),
+            _curve_id_from_name(ecc_numbers.curve.name),
             TPM2_ALG_NULL,
         )
-        unique_x = numbers.x.to_bytes(
-            (numbers.x.bit_length() + 7) // 8, byteorder="big"
-        )
-        unique_y = numbers.y.to_bytes(
-            (numbers.y.bit_length() + 7) // 8, byteorder="big"
-        )
+        unique_x = ecc_numbers.x.to_bytes((ecc_numbers.x.bit_length() + 7) // 8, byteorder="big")
+        unique_y = ecc_numbers.y.to_bytes((ecc_numbers.y.bit_length() + 7) // 8, byteorder="big")
         unique = _pack_in_tpm2b(unique_x) + _pack_in_tpm2b(unique_y)
     else:
         raise ValueError("Unsupported public key type")
@@ -321,7 +384,7 @@ def tpm2b_public_from_pubkey(pubkey: pubkey_type, name_alg: int, attributes: int
     return _pack_in_tpm2b(tpmt_pub)
 
 
-def _get_hasher_from_name_alg(nameAlg: int):
+def _get_hasher_from_name_alg(nameAlg: int) -> Any:
     if nameAlg == TPM_ALG_SHA1:
         return hashlib.sha1()
     if nameAlg == TPM_ALG_SHA256:
@@ -331,7 +394,7 @@ def _get_hasher_from_name_alg(nameAlg: int):
     if nameAlg == TPM_ALG_SHA512:
         return hashlib.sha512()
 
-    raise ValueError("Unsupported nameAlg %s used" % nameAlg)
+    raise ValueError(f"Unsupported nameAlg {nameAlg} used")
 
 
 def get_tpm2b_public_object_attributes(public: bytes) -> int:
@@ -342,7 +405,21 @@ def get_tpm2b_public_object_attributes(public: bytes) -> int:
         _,
         attrs,
     ) = struct.unpack(">HHHI", public[0:10])
-    return attrs
+    return cast(int, attrs)
+
+
+def get_tpm2b_public_symkey_params(
+    public: bytes,
+) -> Tuple[int, int]:
+    # Ignore length, type, namealg and attributes
+    (public, rest) = _extract_tpm2b(public)
+    if len(rest) != 0:
+        raise ValueError("More in tpm2b_public than tpmt_public")
+    # Ignore the authPolicy
+    (_, sym_parms) = _extract_tpm2b(public[8:])
+
+    sym_alg, symkey_bits = struct.unpack(">HH", sym_parms[0:4])
+    return sym_alg, symkey_bits
 
 
 def get_tpm2b_public_name(public: bytes) -> str:
@@ -369,7 +446,7 @@ def get_tpm2b_public_name(public: bytes) -> str:
     # The name is nameAlg || H(TP_PUBLIC)
     name = tpmt_public[2:4] + hasher.digest()
     # We return it as hex-encoded, since that's the way we pass it onwards
-    return name.hex()
+    return cast(str, name.hex())
 
 
 def object_attributes_description(oas: int) -> str:
@@ -408,3 +485,83 @@ def ek_low_tpm2b_public_from_pubkey(pubkey: pubkey_type) -> bytes:
         EK_LOW_AUTH_POLICY,
         EK_LOW_NON_ASYM_ALG_PARMS,
     )
+
+
+def unmarshal_tpms_clock_info(clock_info: bytes) -> Dict[str, int]:
+    clock, resetCount, restartCount, safe = struct.unpack(">QIIB", clock_info)
+    return {"clock": clock, "resetCount": resetCount, "restartCount": restartCount, "safe": safe}
+
+
+def unmarshal_tpms_quote_info(tpms_quote_info: bytes) -> bytes:
+    # TPMS_QUOTE_INFO: TPML_PCR_SELECTION
+    _, sz = unmarshal_tpml_pcr_selection(tpms_quote_info)
+    o = sz
+    # TPMS_QUOTE_INFO: TPM2B_DIGEST
+    (sz,) = struct.unpack_from(">H", tpms_quote_info, o)
+    o = o + 2
+    (pcrDigest,) = struct.unpack_from(f"{sz}s", tpms_quote_info, o)
+
+    return bytes(pcrDigest)
+
+
+def unmarshal_tpms_attest(tpms_attest: bytes) -> TpmsAttestType:
+    magic, typ = struct.unpack_from(">IH", tpms_attest, 0)
+    if magic != TPM_GENERATED_VALUE:
+        raise Exception("Bad magic in tpms_attest")
+    if typ != TPM_ST_ATTEST_QUOTE:
+        raise Exception(f"Unsupported type in tpms_attest: {typ:#x}")
+    o = 6
+    # TPM2B_NAME
+    (sz,) = struct.unpack_from(">H", tpms_attest, o)
+    o = o + 2 + sz
+    # TPM2B_NAME
+    (sz,) = struct.unpack_from(">H", tpms_attest, o)
+    o = o + 2
+    (extradata,) = struct.unpack_from(f"{sz}s", tpms_attest, o)
+    o = o + sz
+    # TPMS_CLOCK_INFO
+    clock_info = unmarshal_tpms_clock_info(tpms_attest[o : o + 17])
+    o = o + 17
+    # UINT64
+    o = o + 8
+    pcrDigest = unmarshal_tpms_quote_info(tpms_attest[o:])
+
+    return {
+        "clockInfo": clock_info,
+        "extraData": bytes(extradata),
+        "attested.quote.pcrDigest": pcrDigest,
+    }
+
+
+def get_tpms_attest_clock_info(tpms_attest: bytes) -> Dict[str, int]:
+    retDict = unmarshal_tpms_attest(tpms_attest)
+    return retDict["clockInfo"]
+
+
+def unmarshal_tpms_pcr_selection(tpms_pcr_selection: bytes) -> Tuple[int, int, int]:
+    hash_alg, size_of_select = struct.unpack_from(">HB", tpms_pcr_selection, 0)
+    (select,) = struct.unpack_from(f"{size_of_select}s", tpms_pcr_selection, 3)
+    return hash_alg, select, 3 + size_of_select
+
+
+def unmarshal_tpml_pcr_selection(tpml_pcr_selection: bytes) -> Tuple[Dict[int, int], int]:
+    (count,) = struct.unpack_from(">I", tpml_pcr_selection, 0)
+    o = 4
+
+    selections: Dict[int, int] = {}
+    for _ in range(0, count):
+        hash_alg, select, sz = unmarshal_tpms_pcr_selection(tpml_pcr_selection[o:])
+        selections[hash_alg] = select
+        o = o + sz
+
+    return selections, o
+
+
+def tpms_ecc_point_marshal(public_key: EllipticCurvePublicKey) -> bytes:
+    pn = public_key.public_numbers()
+
+    sz = (pn.x.bit_length() + 7) // 8
+    secret = struct.pack(">H", sz) + pn.x.to_bytes(sz, "big")
+
+    sz = (pn.y.bit_length() + 7) // 8
+    return secret + struct.pack(">H", sz) + pn.y.to_bytes(sz, "big")

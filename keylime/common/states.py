@@ -1,8 +1,3 @@
-"""
-SPDX-License-Identifier: Apache-2.0
-Copyright 2020 Kaifeng Wang
-"""
-
 from keylime.common import exception
 
 ######################
@@ -45,9 +40,19 @@ TENANT_FAILED = 10
 """The agent was terminated but failed to be removed form verifier"""
 
 
-VALID_STATES = (REGISTERED, START, SAVED, GET_QUOTE, GET_QUOTE_RETRY,
-                PROVIDE_V, PROVIDE_V_RETRY, FAILED, TERMINATED, INVALID_QUOTE,
-                TENANT_FAILED)
+VALID_STATES = (
+    REGISTERED,
+    START,
+    SAVED,
+    GET_QUOTE,
+    GET_QUOTE_RETRY,
+    PROVIDE_V,
+    PROVIDE_V_RETRY,
+    FAILED,
+    TERMINATED,
+    INVALID_QUOTE,
+    TENANT_FAILED,
+)
 
 APPROVED_REACTIVATE_STATES = [START, GET_QUOTE, GET_QUOTE_RETRY, PROVIDE_V, PROVIDE_V_RETRY]
 
@@ -62,11 +67,11 @@ STATE_REPRESENTATIONS = {
     FAILED: "Failed",
     TERMINATED: "Terminated",
     INVALID_QUOTE: "Invalid Quote",
-    TENANT_FAILED: "Tenant Quote Failed"
+    TENANT_FAILED: "Tenant Quote Failed",
 }
 
 
-def state_to_str(state):
+def state_to_str(state: int) -> str:
     if state not in VALID_STATES:
         raise exception.InvalidAgentState()
     return STATE_REPRESENTATIONS[state]

@@ -1,103 +1,111 @@
-'''
-SPDX-License-Identifier: Apache-2.0
-Copyright 2020 Luke Hinds (lhinds@redhat.com), Red Hat, Inc.
-'''
-
 import os
 from configparser import NoOptionError
+from sqlite3 import Connection as SQLite3Connection
+from typing import Any, Dict, Optional, cast
 
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker, scoped_session
+from sqlalchemy import create_engine, event
+from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy.engine.url import URL
+from sqlalchemy.orm import Session, scoped_session, sessionmaker
 
-from keylime import config
-from keylime import keylime_logging
+from keylime import config, keylime_logging
 
-logger = keylime_logging.init_logging('keylime_db')
+logger = keylime_logging.init_logging("keylime_db")
+
+
+# make sure referential integrity is working for SQLite
+@event.listens_for(Engine, "connect")  # type: ignore
+def _set_sqlite_pragma(dbapi_connection: SQLite3Connection, _) -> None:
+    if isinstance(dbapi_connection, SQLite3Connection):
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
+
 
 class DBEngineManager:
+    service: Optional[str]
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.service = None
 
-    def make_engine(self, service):
+    def make_engine(self, service: str) -> Engine:
         """
         To use: engine = self.make_engine('cloud_verifier')
         """
+
+        # Keep DB related stuff as it is, but read configuration from new
+        # configs
+        if service == "cloud_verifier":
+            config_service = "verifier"
+        else:
+            config_service = service
+
         self.service = service
 
-        try :
-            p_sz_m_ovfl = config.get(service, 'database_pool_sz_ovfl')
-            p_sz, m_ovfl = p_sz_m_ovfl.split(',')
+        try:
+            p_sz_m_ovfl = config.get(config_service, "database_pool_sz_ovfl")
+            p_sz, m_ovfl = p_sz_m_ovfl.split(",")
         except NoOptionError:
-            p_sz = 5
-            m_ovfl = 10
+            p_sz = "5"
+            m_ovfl = "10"
 
-        engine_args = {}
+        engine_args: Dict[str, Any] = {}
 
-        url = config.get(service, 'database_url')
+        url = config.get(config_service, "database_url")
         if url:
-            logger.info('database_url is set, using it to establish database connection')
-            engine_args['pool_size'] = int(p_sz)
-            engine_args['max_overflow'] = int(m_ovfl)
+            logger.info("database_url is set, using it to establish database connection")
 
-        else :
-            logger.info('database_url is not set, using multi-parameter database configuration options')
+            # If the keyword sqlite is provided as the database url, use the
+            # cv_data.sqlite for the verifier or the file reg_data.sqlite for
+            # the registrar, located at the config.WORK_DIR directory
+            if url == "sqlite":
+                logger.info(
+                    "database_url is set as 'sqlite' keyword, using default values to establish database connection"
+                )
+                if service == "cloud_verifier":
+                    database = "cv_data.sqlite"
+                elif service == "registrar":
+                    database = "reg_data.sqlite"
+                else:
+                    logger.error("Tried to setup database access for unknown service '%s'", service)
+                    raise Exception(f"Unknown service '{service}' for database setup")
 
-            # This code shall be removed once we fully deprecate the old format
-            try :
-                drivername = config.get(service, 'drivername')
-                database = config.get(service, 'database')
-                logger.warning('Deprecation reminder: please add the suffix "database_" to all database-related parameters in your keylime.conf.')
-                p_n_prefix = ''
-            except NoOptionError:
-                drivername = config.get(service, 'database_drivername')
-                p_n_prefix = "database_"
-                database = config.get(service, p_n_prefix + 'name')
+                database_file = os.path.abspath(os.path.join(config.WORK_DIR, database))
+                url = f"sqlite:///{database_file}"
 
-            if drivername == 'sqlite':
-                database_file = "%s/%s" % (config.WORK_DIR, database)
                 kl_dir = os.path.dirname(os.path.abspath(database_file))
                 if not os.path.exists(kl_dir):
                     os.makedirs(kl_dir, 0o700)
 
-                url = URL(
-                    drivername=drivername,
-                    username=None,
-                    password=None,
-                    host=None,
-                    database=(database_file)
-                )
-                engine_args['connect_args'] = {'check_same_thread': False}
+                engine_args["connect_args"] = {"check_same_thread": False}
 
-            else:
-                url = URL(
-                    drivername=drivername,
-                    username=config.get(service, p_n_prefix + 'username'),
-                    password=config.get(service, p_n_prefix + 'password'),
-                    host=config.get(service, p_n_prefix + 'host'),
-                    database=database
-                )
-                engine_args['pool_size'] = int(p_sz)
-                engine_args['max_overflow'] = int(m_ovfl)
+            if not url.count("sqlite:"):
+                engine_args["pool_size"] = int(p_sz)
+                engine_args["max_overflow"] = int(m_ovfl)
+                engine_args["pool_pre_ping"] = True
+
+        # Enable DB debugging
+        if config.DEBUG_DB and config.INSECURE_DEBUG:
+            engine_args["echo"] = True
 
         engine = create_engine(url, **engine_args)
         return engine
 
 
 class SessionManager:
-    def __init__(self):
+    engine: Optional[Engine]
+
+    def __init__(self) -> None:
         self.engine = None
 
-    def make_session(self, engine):
+    def make_session(self, engine: Engine) -> Session:
         """
         To use: session = self.make_session(engine)
         """
         self.engine = engine
+        MySession = scoped_session(sessionmaker())
         try:
-            Session = scoped_session(sessionmaker())
-            Session.configure(bind=self.engine)
+            MySession.configure(bind=self.engine)  # type: ignore
         except SQLAlchemyError as e:
-            logger.error('Error creating SQL session manager %s', e)
-        return Session()
+            logger.error("Error creating SQL session manager %s", e)
+        return cast(Session, MySession())

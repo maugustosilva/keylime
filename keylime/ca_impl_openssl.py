@@ -1,21 +1,24 @@
-'''
-SPDX-License-Identifier: Apache-2.0
-Copyright 2017 Massachusetts Institute of Technology.
-'''
-
 import datetime
+from typing import List, Optional, Tuple
 
 from cryptography import x509
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.primitives.asymmetric.dsa import DSAPrivateKey
+from cryptography.hazmat.primitives.asymmetric.ec import EllipticCurvePrivateKey
+from cryptography.hazmat.primitives.asymmetric.ed448 import Ed448PrivateKey
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives.asymmetric.rsa import RSAPrivateKey, RSAPublicKey
+from cryptography.hazmat.primitives.serialization import Encoding, load_pem_private_key
+from cryptography.x509 import Certificate, CertificateBuilder, Name
 from cryptography.x509.oid import NameOID
 
 from keylime import config
-from keylime import keylime_logging
+from keylime.types import CERTIFICATE_PRIVATE_KEY_TYPES
 
 
-def mk_cert_valid(cert_req, days=365):
+def mk_cert_valid(cert_req: CertificateBuilder, days: int = 365) -> CertificateBuilder:
     """
     Make a cert valid from now and til 'days' from now.
     Args:
@@ -31,28 +34,20 @@ def mk_cert_valid(cert_req, days=365):
     return cert_req
 
 
-def mk_name(common_name):
+def mk_name(common_name: str) -> Name:
     return x509.Name(
         [
             x509.NameAttribute(NameOID.COUNTRY_NAME, config.get("ca", "cert_country")),
             x509.NameAttribute(NameOID.COMMON_NAME, common_name),
-            x509.NameAttribute(
-                NameOID.STATE_OR_PROVINCE_NAME, config.get("ca", "cert_state")
-            ),
-            x509.NameAttribute(
-                NameOID.LOCALITY_NAME, config.get("ca", "cert_locality")
-            ),
-            x509.NameAttribute(
-                NameOID.ORGANIZATION_NAME, config.get("ca", "cert_organization")
-            ),
-            x509.NameAttribute(
-                NameOID.ORGANIZATIONAL_UNIT_NAME, config.get("ca", "cert_org_unit")
-            ),
+            x509.NameAttribute(NameOID.STATE_OR_PROVINCE_NAME, config.get("ca", "cert_state")),
+            x509.NameAttribute(NameOID.LOCALITY_NAME, config.get("ca", "cert_locality")),
+            x509.NameAttribute(NameOID.ORGANIZATION_NAME, config.get("ca", "cert_organization")),
+            x509.NameAttribute(NameOID.ORGANIZATIONAL_UNIT_NAME, config.get("ca", "cert_org_unit")),
         ]
     )
 
 
-def mk_request(bits, common_name):
+def mk_request(bits: int, common_name: str) -> Tuple[CertificateBuilder, RSAPrivateKey]:
     """
     Create a X509 request with the given number of bits in they key.
     Args:
@@ -74,7 +69,7 @@ def mk_request(bits, common_name):
     return cert_req, privkey
 
 
-def mk_cacert(name=None):
+def mk_cacert(name: Optional[str] = None) -> Tuple[Certificate, RSAPrivateKey, RSAPublicKey]:
     """
     Make a CA certificate.
     Returns the certificate, private key and public key.
@@ -136,7 +131,9 @@ def mk_cacert(name=None):
     return cert, privkey, pubkey
 
 
-def mk_signed_cert(cacert, ca_privkey, name, serialnum):
+def mk_signed_cert(
+    cacert: Certificate, ca_privkey: CERTIFICATE_PRIVATE_KEY_TYPES, name: str, serialnum: int
+) -> Tuple[Certificate, RSAPrivateKey]:
     """
     Create a CA cert + server cert + server private key.
     """
@@ -185,8 +182,25 @@ def mk_signed_cert(cacert, ca_privkey, name, serialnum):
     return cert, privkey
 
 
-def gencrl(_, a, b):
-    del a, b
-    logger = keylime_logging.init_logging('ca_impl_openssl')
-    logger.warning("CRL creation with openssl is not supported")
-    return b""
+def gencrl(serials: List[int], cert: str, ca_pk: str) -> bytes:
+    ca_cert = x509.load_pem_x509_certificate(cert.encode())
+    priv_key = load_pem_private_key(ca_pk.encode(), None, backend=default_backend())
+    date_now = datetime.datetime.now(datetime.timezone.utc)
+
+    builder = x509.CertificateRevocationListBuilder()
+    builder = builder.issuer_name(ca_cert.issuer)
+    builder = builder.last_update(date_now)
+    builder = builder.next_update(date_now)
+
+    for serial in serials:
+        cert_builder = x509.RevokedCertificateBuilder()
+        cert_builder = cert_builder.serial_number(int(serial))
+        cert_builder = cert_builder.revocation_date(date_now)
+        builder = builder.add_revoked_certificate(cert_builder.build())
+
+    if not isinstance(
+        priv_key, (EllipticCurvePrivateKey, RSAPrivateKey, DSAPrivateKey, Ed448PrivateKey, Ed25519PrivateKey)
+    ):
+        raise ValueError(f"Unsupported key type {type(priv_key).__name__}")
+    crl = builder.sign(private_key=priv_key, algorithm=hashes.SHA256(), backend=default_backend())
+    return crl.public_bytes(encoding=Encoding.DER)

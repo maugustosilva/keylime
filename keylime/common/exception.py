@@ -1,7 +1,4 @@
-"""
-SPDX-License-Identifier: Apache-2.0
-Copyright 2020 Kaifeng Wang
-"""
+from typing import Any, Dict, Optional
 
 
 class KeylimeException(Exception):
@@ -9,7 +6,7 @@ class KeylimeException(Exception):
 
     _msg_fmt = "An unknown exception occurred."
 
-    def __init__(self, message=None, **kwargs):
+    def __init__(self, message: Optional[str] = None, **kwargs: Dict[str, Any]):
         if not message:
             message = self._msg_fmt % kwargs
 

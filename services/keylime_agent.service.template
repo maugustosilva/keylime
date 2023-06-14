@@ -1,9 +1,0 @@
-[Unit]
-Description=The Keylime compute agent
-
-[Service]
-ExecStart=KEYLIMEDIR/keylime_agent
-KillSignal=SIGINT
-
-[Install]
-WantedBy=default.target

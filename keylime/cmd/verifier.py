@@ -1,23 +1,19 @@
-#!/usr/bin/python3
+from keylime import cloud_verifier_tornado, config, keylime_logging
+from keylime.common.migrations import apply
+from keylime.mba import mba
 
-'''
-SPDX-License-Identifier: Apache-2.0
-Copyright 2017 Massachusetts Institute of Technology.
-'''
-
-from keylime import keylime_logging
-from keylime import config
-from keylime import cloud_verifier_tornado
-import keylime.cmd.migrations_apply
-
-logger = keylime_logging.init_logging('cloudverifier')
+logger = keylime_logging.init_logging("verifier")
 
 
-def main():
+def main() -> None:
     # if we are configured to auto-migrate the DB, check if there are any migrations to perform
-    if config.has_option('cloud_verifier', 'auto_migrate_db') and config.getboolean('cloud_verifier', 'auto_migrate_db'):
-        keylime.cmd.migrations_apply.apply('cloud_verifier')
+    if config.has_option("verifier", "auto_migrate_db") and config.getboolean("verifier", "auto_migrate_db"):
+        apply("cloud_verifier")
 
+    # Load explicitly the policy modules into Keylime for the verifier,
+    # so that they are not loaded accidentally from other components
+    mba.load_policy_engine()
+    mba.load_parser_engine()
     cloud_verifier_tornado.main()
 
 

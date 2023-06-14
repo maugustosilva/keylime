@@ -1,35 +1,37 @@
-"""
-SPDX-License-Identifier: Apache-2.0
-Copyright 2021 Red Hat, Inc.
-"""
-
 import base64
 import unittest
 
 from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives.asymmetric import ec, rsa
 from cryptography.x509 import load_der_x509_certificate
 
 from keylime.tpm.tpm2_objects import (
+    OA_ADMINWITHPOLICY,
+    OA_DECRYPT,
+    OA_ENCRYPTEDDUPLICATION,
+    OA_FIXEDPARENT,
+    OA_FIXEDTPM,
+    OA_NODA,
+    OA_RESTRICTED,
+    OA_SENSITIVEDATAORIGIN,
+    OA_SIGN_ENCRYPT,
+    OA_STCLEAR,
+    OA_USERWITHAUTH,
+    TPM_ALG_AES,
+    TPM_ALG_SHA256,
     ek_low_tpm2b_public_from_pubkey,
     get_tpm2b_public_name,
     get_tpm2b_public_object_attributes,
+    get_tpm2b_public_symkey_params,
     object_attributes_description,
     pubkey_from_tpm2b_public,
-    OA_FIXEDTPM,
-    OA_STCLEAR,
-    OA_FIXEDPARENT,
-    OA_SENSITIVEDATAORIGIN,
-    OA_USERWITHAUTH,
-    OA_ADMINWITHPOLICY,
-    OA_NODA,
-    OA_ENCRYPTEDDUPLICATION,
-    OA_RESTRICTED,
-    OA_DECRYPT,
-    OA_SIGN_ENCRYPT,
+    pubkey_parms_from_tpm2b_public,
+    unmarshal_tpms_attest,
 )
 
+
 class TestTpm2Objects(unittest.TestCase):
-    def test_get_tpm2b_public_name(self):
+    def test_get_tpm2b_public_name(self) -> None:
         test_pub = base64.b64decode(
             "ARgAAQALAAUAcgAAABAAFAALCAAAAAAAAQDJBIF+SxeEt8TAwcnMZIvJWs3luBARcI"
             "HXC7I/XH7ZXbwLyispm/tpvhRw0w60JbwF4om1LbApQbG9cWR7AOi3ykv5bOgszsIG"
@@ -38,14 +40,11 @@ class TestTpm2Objects(unittest.TestCase):
             "649mg6EHyv0geSHXojx0Iqjsl/NQXzOCvyuaf6CBu9pkiIZCePlrl2uD1tXEdX0ipB"
             "B9Fppc/5cJQ2NyJOuvi4MUK5y38QpwnZwd4Utr2WdyEPoF"
         )
-        test_pub_correct_name = (
-            "000b347dbfebe5bdbc55f6782a3cba91610f9d1b554a1aef07b4db28cf36da9390"
-            "09"
-        )
+        test_pub_correct_name = "000b347dbfebe5bdbc55f6782a3cba91610f9d1b554a1aef07b4db28cf36da939009"
         new_name = get_tpm2b_public_name(test_pub)
         self.assertEqual(new_name, test_pub_correct_name)
 
-    def test_get_tpm2b_public_object_attributes(self):
+    def test_get_tpm2b_public_object_attributes(self) -> None:
         test_pub = base64.b64decode(
             "ARgAAQALAAUAcgAAABAAFAALCAAAAAAAAQDJBIF+SxeEt8TAwcnMZIvJWs3luBARcI"
             "HXC7I/XH7ZXbwLyispm/tpvhRw0w60JbwF4om1LbApQbG9cWR7AOi3ykv5bOgszsIG"
@@ -55,12 +54,7 @@ class TestTpm2Objects(unittest.TestCase):
             "B9Fppc/5cJQ2NyJOuvi4MUK5y38QpwnZwd4Utr2WdyEPoF"
         )
         expected_attributes = (
-            OA_RESTRICTED
-            | OA_USERWITHAUTH
-            | OA_SIGN_ENCRYPT
-            | OA_FIXEDTPM
-            | OA_FIXEDPARENT
-            | OA_SENSITIVEDATAORIGIN
+            OA_RESTRICTED | OA_USERWITHAUTH | OA_SIGN_ENCRYPT | OA_FIXEDTPM | OA_FIXEDPARENT | OA_SENSITIVEDATAORIGIN
         )
         new_attributes = get_tpm2b_public_object_attributes(test_pub)
         self.assertEqual(new_attributes, expected_attributes)
@@ -74,8 +68,8 @@ class TestTpm2Objects(unittest.TestCase):
     # The RSA set is according to Template L-1, section B.3.3
     # The EC set is according to Template L-2, section B.3.4
 
-    def test_tpm2b_public_from_pubkey_rsa(self):
-        test_rsa_cert = base64.b64decode(
+    def test_tpm2b_public_from_pubkey_rsa(self) -> None:
+        test_rsa_cert_bytes = base64.b64decode(
             "MIIEnDCCA4SgAwIBAgIEL8wtHjANBgkqhkiG9w0BAQsFADCBgzELMAkGA1UEBhMCRE"
             "UxITAfBgNVBAoMGEluZmluZW9uIFRlY2hub2xvZ2llcyBBRzEaMBgGA1UECwwRT1BU"
             "SUdBKFRNKSBUUE0yLjAxNTAzBgNVBAMMLEluZmluZW9uIE9QVElHQShUTSkgUlNBIE"
@@ -110,16 +104,14 @@ class TestTpm2Objects(unittest.TestCase):
             "GOQ3xK4wuMoFBmOH6sRsegW4bshv2k25ys8DJyJ3gQEFAHrmP2KtnwL5l1RSQozmGw"
             "OFx6eb/QB1+oAZewW2wRrwO4MQ=="
         )
-        test_rsa_cert = load_der_x509_certificate(
-            test_rsa_cert, backend=default_backend()
-        )
-        new_rsa_obj = ek_low_tpm2b_public_from_pubkey(
-            test_rsa_cert.public_key()
-        )
+        test_rsa_cert = load_der_x509_certificate(test_rsa_cert_bytes, backend=default_backend())
+        test_rsa_pubkey = test_rsa_cert.public_key()
+        assert isinstance(test_rsa_pubkey, rsa.RSAPublicKey)
+        new_rsa_obj = ek_low_tpm2b_public_from_pubkey(test_rsa_pubkey)
         self.assertEqual(new_rsa_obj.hex(), correct_rsa_obj.hex())
 
-    def test_tpm2b_public_from_pubkey_ec(self):
-        test_ec_cert = base64.b64decode(
+    def test_tpm2b_public_from_pubkey_ec(self) -> None:
+        test_ec_cert_bytes = base64.b64decode(
             "MIIDEDCCAragAwIBAgIEcYSJiTAKBggqhkjOPQQDAjCBgzELMAkGA1UEBhMCREUxIT"
             "AfBgNVBAoMGEluZmluZW9uIFRlY2hub2xvZ2llcyBBRzEaMBgGA1UECwwRT1BUSUdB"
             "KFRNKSBUUE0yLjAxNTAzBgNVBAMMLEluZmluZW9uIE9QVElHQShUTSkgRUNDIE1hbn"
@@ -142,14 +134,14 @@ class TestTpm2Objects(unittest.TestCase):
             "MAEAADABAAINK9AtBnW5bwNG2ZIWDrM8w/h03Ht2lp3MUosV05DeBHACBZkRl+Yqwc"
             "wGqmoOwgqQSByVBrADgEVHlhS9J2tJQNMQ=="
         )
-        test_ec_cert = load_der_x509_certificate(
-            test_ec_cert, backend=default_backend()
-        )
-        new_ec_obj = ek_low_tpm2b_public_from_pubkey(test_ec_cert.public_key())
+        test_ec_cert = load_der_x509_certificate(test_ec_cert_bytes, backend=default_backend())
+        test_ec_pubkey = test_ec_cert.public_key()
+        assert isinstance(test_ec_pubkey, ec.EllipticCurvePublicKey)
+        new_ec_obj = ek_low_tpm2b_public_from_pubkey(test_ec_pubkey)
         self.assertEqual(new_ec_obj.hex(), correct_ec_obj.hex())
 
-    def test_pubkey_from_tpm2b_public_rsa(self):
-        test_rsa_cert = base64.b64decode(
+    def test_pubkey_from_tpm2b_public_rsa(self) -> None:
+        test_rsa_cert_bytes = base64.b64decode(
             "MIIEnDCCA4SgAwIBAgIEL8wtHjANBgkqhkiG9w0BAQsFADCBgzELMAkGA1UEBhMCRE"
             "UxITAfBgNVBAoMGEluZmluZW9uIFRlY2hub2xvZ2llcyBBRzEaMBgGA1UECwwRT1BU"
             "SUdBKFRNKSBUUE0yLjAxNTAzBgNVBAMMLEluZmluZW9uIE9QVElHQShUTSkgUlNBIE"
@@ -175,9 +167,7 @@ class TestTpm2Objects(unittest.TestCase):
             "0FH9UAvvR8byEbK+adE+teBUOexdXhTC1ZmPZmTvHSqmeRV3UTZFZRnyOTBnN8QlN0"
             "pMVmwFTak931PqxV0xOSXkMcvTre39jzkhEJ+VMb5EOMFfsVn+b4snob9jank="
         )
-        test_rsa_cert = load_der_x509_certificate(
-            test_rsa_cert, backend=default_backend()
-        )
+        test_rsa_cert = load_der_x509_certificate(test_rsa_cert_bytes, backend=default_backend())
         correct_rsa_obj = base64.b64decode(
             "AToAAQALAAMAsgAgg3GXZ0SEs/gakMyNRqXXJP1S124GUgtk8qHaGzMUaaoABgCAAE"
             "MAEAgAAAAAAAEAtoiuJckJJQp29ZENh1Fu11MryLt4InAdXw2FDwKivw0qhWauc50O"
@@ -188,14 +178,20 @@ class TestTpm2Objects(unittest.TestCase):
             "OFx6eb/QB1+oAZewW2wRrwO4MQ=="
         )
         new_rsa_pubkey = pubkey_from_tpm2b_public(correct_rsa_obj)
+        assert isinstance(new_rsa_pubkey, rsa.RSAPublicKey)
         correct_rsa_pubkey = test_rsa_cert.public_key()
+        assert isinstance(correct_rsa_pubkey, rsa.RSAPublicKey)
         new_rsa_pubkey_n = new_rsa_pubkey.public_numbers()
         correct_rsa_pubkey_n = correct_rsa_pubkey.public_numbers()
         self.assertEqual(new_rsa_pubkey.key_size, correct_rsa_pubkey.key_size)
-        self.assertEqual(new_rsa_pubkey_n.e, correct_rsa_pubkey_n.e)
-        self.assertEqual(new_rsa_pubkey_n.n, correct_rsa_pubkey_n.n)
+        self.assertEqual(new_rsa_pubkey_n.e, correct_rsa_pubkey_n.e)  # pylint: disable=no-member
+        self.assertEqual(new_rsa_pubkey_n.n, correct_rsa_pubkey_n.n)  # pylint: disable=no-member
 
-    def test_pubkey_from_tpm2b_public_rsa_without_encryption(self):
+        sym_alg, symkey_bits = get_tpm2b_public_symkey_params(correct_rsa_obj)
+        self.assertEqual(sym_alg, TPM_ALG_AES)
+        self.assertEqual(symkey_bits, 128)
+
+    def test_pubkey_from_tpm2b_public_rsa_without_encryption(self) -> None:
         new_rsa_pubkey = pubkey_from_tpm2b_public(
             bytes.fromhex(
                 "01180001000b00050072000000100014000b0800000000000100cac43903c6"
@@ -210,12 +206,13 @@ class TestTpm2Objects(unittest.TestCase):
                 "dde753"
             )
         )
+        assert isinstance(new_rsa_pubkey, rsa.RSAPublicKey)
         new_rsa_pubkey_n = new_rsa_pubkey.public_numbers()
 
         self.assertEqual(new_rsa_pubkey.key_size, 2048)
-        self.assertEqual(new_rsa_pubkey_n.e, 65537)
+        self.assertEqual(new_rsa_pubkey_n.e, 65537)  # pylint: disable=no-member
         self.assertEqual(
-            str(new_rsa_pubkey_n.n),
+            str(new_rsa_pubkey_n.n),  # pylint: disable=no-member
             "255968986296679270326283402717529063492526907681140893873754141432"
             "890531031973586937300971300465026177966018575012122367284728088154"
             "485873651193407172159946655006581809152369460009001515677703036255"
@@ -228,8 +225,8 @@ class TestTpm2Objects(unittest.TestCase):
             "71106286823536420841299",
         )
 
-    def test_pubkey_from_tpm2b_public_ec(self):
-        test_ec_cert = base64.b64decode(
+    def test_pubkey_from_tpm2b_public_ec(self) -> None:
+        test_ec_cert_bytes = base64.b64decode(
             "MIIDEDCCAragAwIBAgIEcYSJiTAKBggqhkjOPQQDAjCBgzELMAkGA1UEBhMCREUxIT"
             "AfBgNVBAoMGEluZmluZW9uIFRlY2hub2xvZ2llcyBBRzEaMBgGA1UECwwRT1BUSUdB"
             "KFRNKSBUUE0yLjAxNTAzBgNVBAMMLEluZmluZW9uIE9QVElHQShUTSkgRUNDIE1hbn"
@@ -252,21 +249,20 @@ class TestTpm2Objects(unittest.TestCase):
             "MAEAADABAAINK9AtBnW5bwNG2ZIWDrM8w/h03Ht2lp3MUosV05DeBHACBZkRl+Yqwc"
             "wGqmoOwgqQSByVBrADgEVHlhS9J2tJQNMQ=="
         )
-        test_ec_cert = load_der_x509_certificate(
-            test_ec_cert, backend=default_backend()
-        )
-        new_ec_pubkey = pubkey_from_tpm2b_public(correct_ec_obj)
+        test_ec_cert = load_der_x509_certificate(test_ec_cert_bytes, backend=default_backend())
+        new_ec_pubkey, name_alg = pubkey_parms_from_tpm2b_public(correct_ec_obj)
+        assert isinstance(new_ec_pubkey, ec.EllipticCurvePublicKey)
+        self.assertEqual(name_alg, TPM_ALG_SHA256)
+
         correct_ec_pubkey = test_ec_cert.public_key()
+        assert isinstance(correct_ec_pubkey, ec.EllipticCurvePublicKey)
         new_ec_pubkey_n = new_ec_pubkey.public_numbers()
         correct_ec_pubkey_n = correct_ec_pubkey.public_numbers()
-        self.assertEqual(
-            new_ec_pubkey_n.curve.name,
-            correct_ec_pubkey_n.curve.name
-        )
+        self.assertEqual(new_ec_pubkey_n.curve.name, correct_ec_pubkey_n.curve.name)
         self.assertEqual(new_ec_pubkey_n.x, correct_ec_pubkey_n.x)
         self.assertEqual(new_ec_pubkey_n.y, correct_ec_pubkey_n.y)
 
-    def test_pubkey_from_tpm2b_public_ec_without_encryption(self):
+    def test_pubkey_from_tpm2b_public_ec_without_encryption(self) -> None:
         new_ec_pubkey = pubkey_from_tpm2b_public(
             bytes.fromhex(
                 "00580023000b00050072000000100018000b000300100020c74568135840f4"
@@ -274,21 +270,20 @@ class TestTpm2Objects(unittest.TestCase):
                 "b53e348bc916b43a015e6ceefd947d685e59ff65357499f2c4788cba"
             )
         )
+        assert isinstance(new_ec_pubkey, ec.EllipticCurvePublicKey)
         new_ec_pubkey_n = new_ec_pubkey.public_numbers()
 
         self.assertEqual(new_ec_pubkey_n.curve.name, "secp256r1")
         self.assertEqual(
             str(new_ec_pubkey_n.x),
-            "901328876186929754842544537316510944104832864446891914011641755043"
-            "34705501424",
+            "90132887618692975484254453731651094410483286444689191401164175504334705501424",
         )
         self.assertEqual(
             str(new_ec_pubkey_n.y),
-            "428583369628394219355595706223697775291854911504755996137787899503"
-            "32157332666",
+            "42858336962839421935559570622369777529185491150475599613778789950332157332666",
         )
 
-    def test_object_attributes_description(self):
+    def test_object_attributes_description(self) -> None:
         with self.subTest(attrs="sign-encrypt"):
             val = object_attributes_description((OA_SIGN_ENCRYPT))
             self.assertEqual(val, "sign-encrypt")
@@ -319,6 +314,20 @@ class TestTpm2Objects(unittest.TestCase):
                 "user-with-auth | admin-with-policy | no-da | "
                 "encrypted-duplication | restricted | decrypt | sign-encrypt",
             )
+
+    def test_unmarshal_tpms_attest(self) -> None:
+        tpms_attest = base64.b64decode(
+            "/1RDR4AYACIACzi1x2WoenP+buZXpt2LdpW0GTj5lBE6PXQmPZ0upQM0ABRBaTVNNVNqWWpua3l2"
+            "NFA3aXRIMQAAAABMlE7mAAAAAwAAAAABIBkQIwAWNjYAAAABAAsDAAABACBtTTdJEy9iVxchZM1f"
+            "8xNfRHlz1KXITgGJAfZ1NwW3AQ=="
+        )
+        retDict = unmarshal_tpms_attest(tpms_attest)
+        self.assertEqual(retDict["clockInfo"], {"clock": 1284787942, "resetCount": 3, "restartCount": 0, "safe": 1})
+        self.assertEqual(retDict["extraData"].hex(), "4169354d35536a596a6e6b797634503769744831")
+        self.assertEqual(
+            retDict["attested.quote.pcrDigest"].hex(),
+            "6d4d3749132f6257172164cd5ff3135f447973d4a5c84e018901f6753705b701",
+        )
 
 
 if __name__ == "__main__":

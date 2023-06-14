@@ -28,6 +28,9 @@ tpm2-abrmd \
     --flush-all \
     --allow-root &
 
+# Create test user
+useradd -s /sbin/nologin -g tss keylime
+
 # Run tests
 if [ "$GITHUB_ACTIONS" == "true" ]
 then
@@ -43,5 +46,15 @@ then
     mv /etc/keylime.conf /etc/keylime.conf.orig
 fi
 
+# Move configuration files that might be distributed with the container.
+for c in agent verifier registrar tenant ca logging
+do
+    if [ -f "/etc/keylime/$c.conf" ]
+    then
+        echo "Moving /etc/keylime/$c.conf from the container to /etc/keylime/$c.conf.orig"
+        mv /etc/keylime/$c.conf /etc/keylime/$c.conf.orig
+    fi
+done
+
 chmod +x $REPO_DIR/test/run_tests.sh
-$REPO_DIR/test/run_tests.sh -s openssl
+$REPO_DIR/test/run_tests.sh

@@ -1,9 +1,7 @@
-'''
-SPDX-License-Identifier: Apache-2.0
-Copyright 2017 Massachusetts Institute of Technology.
+"""Database migration
 
-Database migration
-'''
+"""
+
 import logging
 import re
 import sys
@@ -27,9 +25,14 @@ logger = logging.getLogger("alembic.env")
 # gather section names referring to different
 # databases.  These are named "engine1", "engine2"
 # in the sample .ini file.
-db_names = context.get_x_argument(as_dictionary=True).get('db')
-if not db_names:
-    db_names = config.get_main_option("databases")
+db_names = ""
+db_names_ = context.get_x_argument(as_dictionary=True).get("db")
+if db_names_:
+    db_names = db_names_
+else:
+    db_names_ = config.get_main_option("databases")
+    if db_names_:
+        db_names = db_names_
 
 # add your model's MetaData objects here
 # for 'autogenerate' support.  These must be set
@@ -42,10 +45,7 @@ if not db_names:
 #       'engine1':mymodel.metadata1,
 #       'engine2':mymodel.metadata2
 # }
-target_metadata = {
-    'registrar': RegistrarBase.metadata,
-    'cloud_verifier': VerifierBase.metadata
-}
+target_metadata = {"registrar": RegistrarBase.metadata, "cloud_verifier": VerifierBase.metadata}
 
 # other values from the config, defined by the needs of env.py,
 # can be acquired:
@@ -69,9 +69,8 @@ def run_migrations_offline():
     # individual files.
 
     for name in re.split(r",\s*", db_names):
-
         logger.info("Migrating database %s", name)
-        file_ = "%s.sql" % name
+        file_ = f"{name}.sql"
         logger.info("Writing output to %s", file_)
 
         with open(file_, "w", encoding="utf-8") as buffer:
@@ -119,10 +118,10 @@ def run_migrations_online():
             logger.info("Migrating database %s", name)
             context.configure(
                 connection=rec["connection"],
-                upgrade_token="%s_upgrades" % name,
-                downgrade_token="%s_downgrades" % name,
+                upgrade_token=f"{name}_upgrades",
+                downgrade_token=f"{name}_downgrades",
                 target_metadata=target_metadata.get(name),
-                version_table="alembic_version_" + name,
+                version_table=f"alembic_version_{name}",
             )
             context.run_migrations(engine_name=name)
 

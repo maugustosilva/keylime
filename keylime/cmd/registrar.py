@@ -1,27 +1,21 @@
-#!/usr/bin/python3
+from keylime import config, keylime_logging, registrar_common
+from keylime.common.migrations import apply
 
-'''
-SPDX-License-Identifier: Apache-2.0
-Copyright 2017 Massachusetts Institute of Technology.
-'''
-
-from keylime import registrar_common
-from keylime import config
-from keylime import keylime_logging
-import keylime.cmd.migrations_apply
-
-logger = keylime_logging.init_logging('registrar')
+logger = keylime_logging.init_logging("registrar")
 
 
-def main():
+def main() -> None:
+    config.check_version("registrar", logger=logger)
+
     # if we are configured to auto-migrate the DB, check if there are any migrations to perform
-    if config.has_option('registrar', 'auto_migrate_db') and config.getboolean('registrar', 'auto_migrate_db'):
-        keylime.cmd.migrations_apply.apply('registrar')
+    if config.has_option("registrar", "auto_migrate_db") and config.getboolean("registrar", "auto_migrate_db"):
+        apply("registrar")
 
     registrar_common.start(
-        config.get('registrar', 'registrar_ip'),
-        config.getint('registrar', 'registrar_tls_port'),
-        config.getint('registrar', 'registrar_port'))
+        config.get("registrar", "ip"),
+        config.getint("registrar", "tls_port"),
+        config.getint("registrar", "port"),
+    )
 
 
 if __name__ == "__main__":

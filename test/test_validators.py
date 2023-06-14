@@ -8,21 +8,19 @@ class TestValidRegex(unittest.TestCase):
 
     def test_none(self):
         """Check that None is a valid regex."""
-        self.assertEqual(validators.valid_regex(None), (True, None, None))
+        self.assertEqual(validators.valid_regex(None), (None, None))
 
     def test_valid(self):
         """Check a well formed regex."""
         value = validators.valid_regex(r"a.*")
-        self.assertTrue(value[0])
-        self.assertEqual(value[1].pattern, r"a.*")
-        self.assertEqual(value[2], None)
+        assert value[0] is not None
+        self.assertEqual(value[0].pattern, r"a.*")
+        self.assertEqual(value[1], None)
 
     def test_invalid(self):
         """Check a not valid regex."""
         value = validators.valid_regex(r"a[")
-        self.assertEqual(
-            value, (False, None, "Invalid regex: unterminated character set.")
-        )
+        self.assertEqual(value, (None, "Invalid regex: unterminated character set."))
 
 
 class TestValidExcludeList(unittest.TestCase):
@@ -30,28 +28,26 @@ class TestValidExcludeList(unittest.TestCase):
 
     def test_none(self):
         """Check that the empty list is valid."""
-        self.assertEqual(validators.valid_exclude_list(None), (True, None, None))
+        self.assertEqual(validators.valid_exclude_list(None), (None, None))
 
     def test_single(self):
         """Check a single exclude list element."""
         value = validators.valid_exclude_list([r"a.*"])
-        self.assertTrue(value[0])
-        self.assertEqual(value[1].pattern, r"(a.*)")
-        self.assertEqual(value[2], None)
+        assert value[0] is not None
+        self.assertEqual(value[0].pattern, r"(a.*)")
+        self.assertEqual(value[1], None)
 
     def test_multi(self):
         """Check a multiple elements exclude list."""
         value = validators.valid_exclude_list([r"a.*", r"b.*"])
-        self.assertTrue(value[0])
-        self.assertEqual(value[1].pattern, r"(a.*)|(b.*)")
-        self.assertEqual(value[2], None)
+        assert value[0] is not None
+        self.assertEqual(value[0].pattern, r"(a.*)|(b.*)")
+        self.assertEqual(value[1], None)
 
     def test_invalid(self):
         """Check an invalid exclude list."""
         value = validators.valid_exclude_list([r"a["])
-        self.assertEqual(
-            value, (False, None, "Invalid regex: unterminated character set.")
-        )
+        self.assertEqual(value, (None, "Invalid regex: unterminated character set."))
 
 
 class TestValidHex(unittest.TestCase):
@@ -74,7 +70,7 @@ class TestValidHex(unittest.TestCase):
         self.assertTrue(validators.valid_hex("123ABC"))
 
     def test_invalid(self):
-        """Check and invalid hexadecimal number."""
+        """Check an invalid hexadecimal number."""
         self.assertFalse(validators.valid_hex("123xyz"))
 
 

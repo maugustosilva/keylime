@@ -1,83 +1,65 @@
-'''
-SPDX-License-Identifier: Apache-2.0
-Copyright 2017 Massachusetts Institute of Technology.
-'''
-
-import os
 import logging
+import ssl
 import sys
+from typing import Any, Dict, Optional
 
-from keylime import config
-from keylime import crypto
-from keylime import json
-from keylime import keylime_logging
-from keylime.requests_client import RequestsClient
 from keylime import api_version as keylime_api_version
+from keylime import keylime_logging
+from keylime.ip_util import bracketize_ipv6
+from keylime.requests_client import RequestsClient
 
-logger = keylime_logging.init_logging('registrar_client')
-tls_cert_info = ()
-tls_enabled = False
+if sys.version_info >= (3, 8):
+    from typing import TypedDict
+else:
+    from typing_extensions import TypedDict
+
+if sys.version_info >= (3, 11):
+    from typing import NotRequired
+else:
+    from typing_extensions import NotRequired
+
+
+class RegistrarData(TypedDict):
+    ip: Optional[str]
+    port: Optional[str]
+    regcount: int
+    mtls_cert: Optional[str]
+    aik_tpm: str
+    ek_tpm: str
+    ekcert: Optional[str]
+    provider_keys: NotRequired[Dict[str, str]]
+
+
+logger = keylime_logging.init_logging("registrar_client")
 api_version = keylime_api_version.current_version()
 
 
-def init_client_tls(section):
-    global tls_cert_info
-    global tls_enabled
+def getData(
+    registrar_ip: str, registrar_port: str, agent_id: str, tls_context: Optional[ssl.SSLContext]
+) -> Optional[RegistrarData]:
+    """
+    Get the agent data from the registrar.
 
-    # make this reentrant
-    if tls_cert_info:
-        return
+    This is called by the tenant code
 
-    if not config.getboolean('general', "enable_tls"):
-        logger.warning("Warning: TLS is currently disabled, AIKs may not be authentic.")
-        return
-
-    logger.warning("TLS is enabled.")
-    tls_enabled = True
-
-    logger.info("Setting up client TLS...")
-    tls_dir = config.get(section, 'registrar_tls_dir')
-
-    my_cert = config.get(section, 'registrar_my_cert')
-    my_priv_key = config.get(section, 'registrar_private_key')
-
-    if tls_dir == 'default':
-        tls_dir = 'reg_ca'
-        my_cert = 'client-cert.crt'
-        my_priv_key = 'client-private.pem'
-
-    if tls_dir == 'CV':
-        tls_dir = 'cv_ca'
-        my_cert = 'client-cert.crt'
-        my_priv_key = 'client-private.pem'
-
-    # this is relative path, convert to absolute in WORK_DIR
-    if tls_dir[0] != '/':
-        tls_dir = os.path.abspath(os.path.join(config.WORK_DIR, tls_dir))
-
-    if os.path.isabs(my_cert):
-        tls_cert = my_cert
-    else:
-        tls_cert = os.path.join(tls_dir, my_cert)
-    if os.path.isabs(my_priv_key):
-        tls_priv_key = my_priv_key
-    else:
-        tls_priv_key = os.path.join(tls_dir, my_priv_key)
-
-    tls_cert_info = (tls_cert, tls_priv_key)
-
-
-def getData(registrar_ip, registrar_port, agent_id):
+    :returns: JSON structure containing the agent data
+    """
     # make absolutely sure you don't ask for data that contains AIK keys unauthenticated
-    if not tls_enabled:
-        raise Exception(
-            "It is unsafe to use this interface to query AIKs without server-authenticated TLS.")
+    if not tls_context:
+        raise Exception("It is unsafe to use this interface to query AIKs without server-authenticated TLS.")
 
     response = None
     try:
-        client = RequestsClient(f'{registrar_ip}:{registrar_port}', tls_enabled)
-        response = client.get(f'/v{api_version}/agents/{agent_id}', cert=tls_cert_info, verify=False)
+        client = RequestsClient(f"{bracketize_ipv6(registrar_ip)}:{registrar_port}", True, tls_context=tls_context)
+        response = client.get(f"/v{api_version}/agents/{agent_id}")
         response_body = response.json()
+
+        if response.status_code == 404:
+            logger.critical(
+                "Error: could not get agent %s data from Registrar Server: %s", agent_id, response.status_code
+            )
+            keylime_logging.log_http_response(logger, logging.CRITICAL, response_body)
+            return None
 
         if response.status_code != 200:
             logger.critical("Error: unexpected http response code from Registrar Server: %s", response.status_code)
@@ -109,7 +91,20 @@ def getData(registrar_ip, registrar_port, agent_id):
             logger.critical("Error: did not receive port from Registrar Server.")
             return None
 
-        return response_body["results"]
+        r = response_body["results"]
+        res: RegistrarData = {
+            "aik_tpm": r["aik_tpm"],
+            "regcount": r["regcount"],
+            "ek_tpm": r["ek_tpm"],
+            "ip": r["ip"],
+            "port": r["port"],
+            "mtls_cert": r.get("mtls_cert"),
+            "ekcert": r.get("ekcert"),
+        }
+        if "provider_keys" in r:
+            res["provider_keys"] = r["provider_keys"]
+
+        return res
 
     except AttributeError as e:
         if response and response.status_code == 503:
@@ -123,78 +118,20 @@ def getData(registrar_ip, registrar_port, agent_id):
     return None
 
 
-def doRegisterAgent(registrar_ip, registrar_port, agent_id, ek_tpm, ekcert, aik_tpm, mtls_cert=None,
-                    contact_ip=None, contact_port=None):
-    data = {
-        'ekcert': ekcert,
-        'aik_tpm': aik_tpm,
-    }
-    if ekcert is None or ekcert == 'emulator':
-        data['ek_tpm'] = ek_tpm
+def doRegistrarDelete(
+    registrar_ip: str, registrar_port: str, agent_id: str, tls_context: Optional[ssl.SSLContext]
+) -> Dict[str, Any]:
+    """
+    Delete the given agent from the registrar.
 
-    if mtls_cert is not None:
-        data['mtls_cert'] = mtls_cert
-    else:
-        logger.error("Most actions require the agent to have mTLS enabled, but no cert was provided!")
-    if contact_ip is not None:
-        data['ip'] = contact_ip
-    if contact_port is not None:
-        data['port'] = contact_port
+    This is called by the tenant code
 
-    response = None
-    try:
-        client = RequestsClient(f'{registrar_ip}:{registrar_port}', tls_enabled)
-        response = client.post(f'/v{api_version}/agents/{agent_id}', cert=tls_cert_info, data=json.dumps(data), verify=False)
-        response_body = response.json()
+    :returns: The request response body
+    """
 
-        if response.status_code != 200:
-            logger.error("Error: unexpected http response code from Registrar Server: %s", response.status_code)
-            keylime_logging.log_http_response(logger, logging.ERROR, response_body)
-            return None
-
-        logger.info("Agent registration requested for %s", agent_id)
-
-        if "results" not in response_body:
-            logger.critical("Error: unexpected http response body from Registrar Server: %s", response.status_code)
-            return None
-
-        if "blob" not in response_body["results"]:
-            logger.critical("Error: did not receive blob from Registrar Server: %s", response.status_code)
-            return None
-
-        return response_body["results"]["blob"]
-    except Exception as e:
-        if response and response.status_code == 503:
-            logger.error("Agent cannot establish connection to registrar at %s:%s", registrar_ip, registrar_port)
-            sys.exit()
-        else:
-            logger.exception(e)
-
-    return None
-
-
-def doActivateAgent(registrar_ip, registrar_port, agent_id, key):
-    data = {
-        'auth_tag': crypto.do_hmac(key, agent_id),
-    }
-    client = RequestsClient(f'{registrar_ip}:{registrar_port}', tls_enabled)
-    response = client.put(f'/v{api_version}/agents/{agent_id}/activate', cert=tls_cert_info, data=json.dumps(data), verify=False)
-    response_body = response.json()
-
-    if response.status_code == 200:
-        logger.info("Registration activated for agent %s.", agent_id)
-        return True
-
-    logger.error(
-        "Error: unexpected http response code from Registrar Server: %s", str(response.status_code))
-    keylime_logging.log_http_response(logger, logging.ERROR, response_body)
-    return False
-
-
-def doRegistrarDelete(registrar_ip, registrar_port, agent_id):
-    client = RequestsClient(f'{registrar_ip}:{registrar_port}', tls_enabled)
-    response = client.delete(f'/v{api_version}/agents/{agent_id}', cert=tls_cert_info, verify=False)
-    response_body = response.json()
+    client = RequestsClient(f"{bracketize_ipv6(registrar_ip)}:{registrar_port}", True, tls_context=tls_context)
+    response = client.delete(f"/v{api_version}/agents/{agent_id}")
+    response_body: Dict[str, Any] = response.json()
 
     if response.status_code == 200:
         logger.debug("Registrar deleted.")
@@ -205,10 +142,19 @@ def doRegistrarDelete(registrar_ip, registrar_port, agent_id):
     return response_body
 
 
-def doRegistrarList(registrar_ip, registrar_port):
-    client = RequestsClient(f'{registrar_ip}:{registrar_port}', tls_enabled)
-    response = client.get(f'/v{api_version}/agents/', cert=tls_cert_info, verify=False)
-    response_body = response.json()
+def doRegistrarList(
+    registrar_ip: str, registrar_port: str, tls_context: Optional[ssl.SSLContext]
+) -> Optional[Dict[str, Any]]:
+    """
+    Get the list of registered agents from the registrar.
+
+    This is called by the tenant code
+
+    :returns: The request response body
+    """
+    client = RequestsClient(f"{bracketize_ipv6(registrar_ip)}:{registrar_port}", True, tls_context=tls_context)
+    response = client.get(f"/v{api_version}/agents/")
+    response_body: Dict[str, Any] = response.json()
 
     if response.status_code != 200:
         logger.warning("Registrar returned: %s Unexpected response from registrar.", response.status_code)

@@ -20,16 +20,33 @@ fi
 echo "Using keylime scripts directory: ${KEYLIMEDIR}"
 
 # prepare keylime service files and store them in systemd path
-sed "s|KEYLIMEDIR|$KEYLIMEDIR|g" $BASEDIR/keylime_agent.service.template > /etc/systemd/system/keylime_agent.service
 sed "s|KEYLIMEDIR|$KEYLIMEDIR|g" $BASEDIR/keylime_registrar.service.template > /etc/systemd/system/keylime_registrar.service
 sed "s|KEYLIMEDIR|$KEYLIMEDIR|g" $BASEDIR/keylime_verifier.service.template > /etc/systemd/system/keylime_verifier.service
 
+echo "Creating keylime user if it not exists"
+if ! getent passwd keylime >/dev/null; then
+    adduser --system --shell /bin/false \
+            --home /var/lib/keylime --no-create-home \
+            keylime
+fi
+
+echo "Changing files to be owned by the keylime user"
+# Create all directories required if not there
+mkdir -p /var/lib/keylime
+mkdir -p /var/log/keylime
+mkdir -p /var/run/keylime
+
+chown keylime:keylime -R /etc/keylime
+chown keylime:keylime -R /var/lib/keylime
+chown keylime:keylime -R /var/log/keylime
+chown keylime:keylime -R /var/run/keylime
+
 # set permissions
-chmod 664 /etc/systemd/system/keylime_agent.service
 chmod 664 /etc/systemd/system/keylime_registrar.service
 chmod 664 /etc/systemd/system/keylime_verifier.service
 
+chmod 700 /var/run/keylime
+
 # enable at startup
-systemctl enable keylime_agent.service
 systemctl enable keylime_registrar.service
 systemctl enable keylime_verifier.service

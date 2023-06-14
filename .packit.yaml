@@ -3,8 +3,6 @@ jobs:
   trigger: pull_request
   metadata:
     targets:
-    - fedora-stable
-    - fedora-rawhide
-    - centos-stream-8-x86_64
+    - fedora-all
     - centos-stream-9-x86_64
     skip_build: true
